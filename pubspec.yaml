@@ -1,0 +1,46 @@
+name: pricex
+description: "PriceX - Buscador de Precos por Codigo de Barras"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # Conexao com MariaDB/MySQL
+  mysql1: ^0.20.0
+
+  # Persistencia local de dados
+  shared_preferences: ^2.2.2
+
+  # Leitura de codigo de barras
+  mobile_scanner: ^6.0.2
+
+  # Som de bip para leitura de codigo de barras
+  audioplayers: ^6.1.0
+
+  # Fontes do Google
+  google_fonts: ^6.1.0
+
+  # Formatacao de valores
+  intl: ^0.20.2
+
+  # Reconhecimento de voz
+  speech_to_text: ^7.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/sounds/
