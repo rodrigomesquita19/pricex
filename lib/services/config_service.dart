@@ -10,6 +10,10 @@ class ConfigService {
   static const String _carrosselAtivoKey = 'carrossel_ativo';
   static const String _tempoCarrosselKey = 'tempo_carrossel_segundos';
 
+  // Chaves PEC
+  static const String _pecCartaoKey = 'pec_cartao';
+  static const String _pecAtivoKey = 'pec_ativo';
+
   /// Salva a configuracao do banco de dados
   static Future<void> saveConfig(DatabaseConfig config) async {
     final prefs = await SharedPreferences.getInstance();
@@ -132,5 +136,37 @@ class ConfigService {
   static Future<int> getTempoCarrossel() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getInt(_tempoCarrosselKey) ?? 10;
+  }
+
+  // ===== CONFIGURACAO PEC =====
+
+  /// Salva o numero do cartao PEC
+  static Future<void> saveCartaoPec(String cartao) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_pecCartaoKey, cartao);
+  }
+
+  /// Obtem o numero do cartao PEC
+  static Future<String?> getCartaoPec() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_pecCartaoKey);
+  }
+
+  /// Salva se o PEC esta ativo
+  static Future<void> savePecAtivo(bool ativo) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_pecAtivoKey, ativo);
+  }
+
+  /// Verifica se o PEC esta ativo
+  static Future<bool> isPecAtivo() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_pecAtivoKey) ?? false;
+  }
+
+  /// Verifica se o PEC esta configurado (cartao preenchido)
+  static Future<bool> hasPecConfig() async {
+    final cartao = await getCartaoPec();
+    return cartao != null && cartao.isNotEmpty;
   }
 }

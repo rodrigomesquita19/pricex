@@ -276,6 +276,27 @@ class DatabaseService {
   /// Retorna o ID do grupo de preco
   static int? get grupoPrecoId => _grupoPrecoId;
 
+  /// Busca o CNPJ da filial (coluna cgc)
+  static Future<String?> getCnpjFilial() async {
+    final conn = await _getConnection();
+    if (conn == null || _filialId == null) return null;
+
+    try {
+      final results = await conn.query('''
+        SELECT cgc FROM filial WHERE filial_id = ? LIMIT 1
+      ''', [_filialId]);
+
+      if (results.isNotEmpty) {
+        final cnpj = results.first['cgc']?.toString() ?? '';
+        // Remover formatacao, deixar so numeros
+        return cnpj.replaceAll(RegExp(r'[^0-9]'), '');
+      }
+    } catch (e) {
+      debugPrint('[DatabaseService] Erro ao buscar CNPJ: $e');
+    }
+    return null;
+  }
+
   /// Fecha a conexao atual
   static Future<void> closeConnection() async {
     if (_connection != null) {
@@ -634,6 +655,7 @@ class DatabaseService {
             /* Flags de permissao efetiva (produto > grupo) */
             COALESCE(ptd_agg.permite_promocao,    gtd_agg.permite_promocao,    'N') AS perm_promocao,
             COALESCE(ptd_agg.permite_desc_avista, gtd_agg.permite_desc_avista, 'N') AS perm_desc_avista,
+            COALESCE(ptd_agg.permite_desc_qtde,   gtd_agg.permite_desc_qtde,   'N') AS perm_desc_qtde,
             COALESCE(ptd_agg.permite_tabloide,    gtd_agg.permite_tabloide,    'N') AS perm_tabloide,
 
             /* Desconto da regra (produto > grupo) */
@@ -673,6 +695,7 @@ class DatabaseService {
                 MAX(ptd.pratica_preco)       AS pratica_preco,
                 MAX(ptd.permite_promocao)    AS permite_promocao,
                 MAX(ptd.permite_desc_avista) AS permite_desc_avista,
+                MAX(ptd.permite_desc_qtde)   AS permite_desc_qtde,
                 MAX(ptd.permite_tabloide)    AS permite_tabloide,
                 AVG(ptd.desconto)            AS desconto
             FROM prod_tabela_desconto ptd
@@ -682,18 +705,18 @@ class DatabaseService {
             GROUP BY ptd.produto_id
         ) ptd_agg ON ptd_agg.produto_id = p.produto_id
 
-        /* Regras do GRUPO agregadas */
+        /* Regras do GRUPO agregadas - busca TODOS os grupos da tabela_desconto */
         LEFT JOIN (
             SELECT
                 gtd.grupo_id,
                 MAX(gtd.pratica_preco)       AS pratica_preco,
                 MAX(gtd.permite_promocao)    AS permite_promocao,
                 MAX(gtd.permite_desc_avista) AS permite_desc_avista,
+                MAX(gtd.permite_desc_qtde)   AS permite_desc_qtde,
                 MAX(gtd.permite_tabloide)    AS permite_tabloide,
                 AVG(gtd.desconto)            AS desconto
             FROM grupo_tabela_desconto gtd
             WHERE gtd.tabela_desconto_id = ?
-              AND gtd.grupo_id = ?
             GROUP BY gtd.grupo_id
         ) gtd_agg ON gtd_agg.grupo_id = p.grupo_id
 
@@ -767,8 +790,7 @@ class DatabaseService {
         _filialId,            // pfil.filial_id
         tabelaDescontoId,     // ptd.tabela_desconto_id
         produtoId,            // ptd.produto_id
-        tabelaDescontoId,     // gtd.tabela_desconto_id
-        grupoId,              // gtd.grupo_id
+        tabelaDescontoId,     // gtd.tabela_desconto_id (busca todos grupos)
         _grupoPrecoId,        // gpp2.grupo_preco_id
         _filialId,            // pmc2.fillogica_id
         _filialId,            // tf.filial_id
@@ -792,10 +814,19 @@ class DatabaseService {
       final precoFilialPromo = (row['preco_filial_promo'] as num?)?.toDouble();
       final precoFilialAvista = (row['preco_filial_avista'] as num?)?.toDouble();
 
-      // Permissoes
-      final permPromocao = row['perm_promocao']?.toString() == 'S';
-      final permDescAvista = row['perm_desc_avista']?.toString() == 'S';
-      final permTabloide = row['perm_tabloide']?.toString() == 'S';
+      // Permissoes (valores brutos do banco)
+      final permPromocaoRaw = row['perm_promocao']?.toString();
+      final permDescAvistaRaw = row['perm_desc_avista']?.toString();
+      final permDescQtdeRaw = row['perm_desc_qtde']?.toString();
+      final permTabloideRaw = row['perm_tabloide']?.toString();
+
+      debugPrint('[PrecoPraticado] produtoId=$produtoId grupoId=$grupoId');
+      debugPrint('[PrecoPraticado] Permissoes RAW: promo=$permPromocaoRaw, avista=$permDescAvistaRaw, qtde=$permDescQtdeRaw, tabloide=$permTabloideRaw');
+
+      final permPromocao = permPromocaoRaw == 'S';
+      final permDescAvista = permDescAvistaRaw == 'S';
+      final permDescQtde = permDescQtdeRaw == 'S';
+      final permTabloide = permTabloideRaw == 'S';
 
       // Descontos
       final descontoRegra = (row['desconto_regra'] as num?)?.toDouble() ?? 0.0;
@@ -904,9 +935,11 @@ class DatabaseService {
         'preco_praticado': precoPraticado,
         'origem_preco': origemPreco,
         'data_fim_promocao': dataFimPromocao?.toIso8601String(),
+        'permite_desc_qtde': permDescQtde,
       };
-    } catch (e) {
+    } catch (e, stackTrace) {
       debugPrint('[DatabaseService] Erro ao calcular preco praticado: $e');
+      debugPrint('[DatabaseService] StackTrace: $stackTrace');
       return null;
     }
   }
@@ -1586,41 +1619,34 @@ class DatabaseService {
           return [];
       }
 
-      // Construir filtro de estoque/desconto
+      // Construir filtro de estoque (desconto sera filtrado em Dart apos calcular precos)
       String filtroAdicional = '';
+      bool filtrarDesconto = false;
+
       switch (filtroEstoqueDesconto) {
         case 'estoque':
           filtroAdicional = 'AND COALESCE(em.estoque, 0) > 0';
           break;
         case 'desconto':
-          // Produtos com promocao ou desconto
-          filtroAdicional = '''
-            AND (
-              gpp.preco_pro IS NOT NULL AND gpp.valid_pro >= CURRENT_DATE
-              OR EXISTS (
-                SELECT 1 FROM desconto_quantidade dq
-                WHERE dq.produto_id = p.Produto_id
-                  AND (dq.filial_id = 0 OR dq.filial_id = $_filialId)
-                  AND (dq.apagado IS NULL OR dq.apagado <> 'S')
-              )
-            )
-          ''';
+          // Desconto sera verificado apos calcular precos (inclui tabela_desconto)
+          filtrarDesconto = true;
           break;
         case 'estoque_desconto':
-          filtroAdicional = '''
-            AND COALESCE(em.estoque, 0) > 0
-            AND (
-              gpp.preco_pro IS NOT NULL AND gpp.valid_pro >= CURRENT_DATE
-              OR EXISTS (
-                SELECT 1 FROM desconto_quantidade dq
-                WHERE dq.produto_id = p.Produto_id
-                  AND (dq.filial_id = 0 OR dq.filial_id = $_filialId)
-                  AND (dq.apagado IS NULL OR dq.apagado <> 'S')
-              )
-            )
-          ''';
+          filtroAdicional = 'AND COALESCE(em.estoque, 0) > 0';
+          filtrarDesconto = true;
           break;
       }
+
+      debugPrint('[Carrossel DB] ===== BUSCA CARROSSEL =====');
+      debugPrint('[Carrossel DB] Tipo filtro: $tipoFiltro');
+      debugPrint('[Carrossel DB] IDs recebidos: $ids');
+      debugPrint('[Carrossel DB] Clausula filtro: $clausulaFiltro');
+      debugPrint('[Carrossel DB] Filtro estoque/desconto: $filtroEstoqueDesconto');
+      debugPrint('[Carrossel DB] filtrarDesconto: $filtrarDesconto');
+      debugPrint('[Carrossel DB] filialId: $_filialId, grupoPrecoId: $_grupoPrecoId');
+
+      // Se vamos filtrar desconto em Dart, buscar mais produtos para ter candidatos
+      final limiteQuery = filtrarDesconto ? limite * 5 : limite;
 
       final results = await conn.query('''
         SELECT
@@ -1643,21 +1669,29 @@ class DatabaseService {
           $filtroAdicional
         ORDER BY RAND()
         LIMIT ?
-      ''', [_filialId, _grupoPrecoId, limite]);
+      ''', [_filialId, _grupoPrecoId, limiteQuery]);
+
+      debugPrint('[Carrossel DB] Query retornou ${results.length} produtos');
 
       final List<Map<String, dynamic>> produtos = [];
+      int produtosSemDesconto = 0;
 
       for (final row in results) {
         final produtoId = (row['Produto_id'] as num?)?.toInt() ?? 0;
         final grupoId = (row['grupo_id'] as num?)?.toInt() ?? 0;
         final precoVnd = (row['preco_vnd'] as num?)?.toDouble() ?? 0;
+        final descricao = row['descricao']?.toString() ?? '';
 
         double precoPraticado = precoVnd;
         double precoCheio = precoVnd;
         String origemPreco = 'NORMAL';
         bool isPromocional = false;
+        DateTime? dataFimPromocao;
+        int? diasRestantesPromocao;
+        bool permiteDescQtde = false;
 
         if (tabelaDescontoId != null && tabelaDescontoId > 0) {
+          debugPrint('[Carrossel DB] Calculando preco para produto $produtoId...');
           final precosCalculados = await _calcularPrecoPraticado(
             produtoId: produtoId,
             grupoId: grupoId,
@@ -1665,16 +1699,99 @@ class DatabaseService {
           );
 
           if (precosCalculados != null) {
+            debugPrint('[Carrossel DB] precosCalculados: $precosCalculados');
             precoCheio = precosCalculados['preco_cheio'] as double;
             precoPraticado = precosCalculados['preco_praticado'] as double;
             origemPreco = precosCalculados['origem_preco'] as String? ?? 'NORMAL';
             isPromocional = precoPraticado < precoCheio;
+            permiteDescQtde = precosCalculados['permite_desc_qtde'] as bool? ?? false;
+            debugPrint('[Carrossel DB] Produto $produtoId: cheio=$precoCheio, praticado=$precoPraticado, permiteDescQtde=$permiteDescQtde');
+
+            // Capturar data fim da promocao
+            final dataFimStr = precosCalculados['data_fim_promocao'] as String?;
+            if (dataFimStr != null) {
+              dataFimPromocao = DateTime.tryParse(dataFimStr);
+              if (dataFimPromocao != null) {
+                diasRestantesPromocao = dataFimPromocao.difference(DateTime.now()).inDays;
+              }
+            }
+          } else {
+            debugPrint('[Carrossel DB] precosCalculados retornou NULL para produto $produtoId');
           }
+        }
+
+        // Buscar info de desconto quantidade para este produto (so se permitido)
+        String? tipoDescontoQtde;
+        int? qtdeCaixaGratis;
+        bool temDescontoQuantidade = false;
+        double? precoUnitarioComDescQtde;
+        double? descontoQtdePercentual;
+        int? qtdeMinimaDesconto;
+        String? textoDescontoQtde;
+
+        // So buscar desconto quantidade se permitido pela tabela de desconto
+        final regrasDescontoQtde = permiteDescQtde ? await buscarDescontoQuantidade(produtoId) : <RegraDescontoQtde>[];
+        if (regrasDescontoQtde.isNotEmpty) {
+          // Criar mapa qtde -> desconto para acesso rapido
+          final Map<int, double> descontoPorQtde = {};
+          int quantidadeMaxima = 0;
+          for (final regra in regrasDescontoQtde) {
+            final qtde = regra.quantidade;
+            descontoPorQtde[qtde] = regra.desconto;
+            if (qtde > quantidadeMaxima) {
+              quantidadeMaxima = qtde;
+            }
+          }
+
+          // Verificar se ultima unidade e gratis (caixa gratis)
+          final descontoUltimaQtde = descontoPorQtde[quantidadeMaxima] ?? 0;
+          final ultimaUnidadeGratis = descontoUltimaQtde >= 99;
+
+          // Calcular preco medio para ciclo completo
+          double totalCiclo = 0;
+          int unidadesPagas = 0;
+          for (int pos = 1; pos <= quantidadeMaxima; pos++) {
+            final desconto = descontoPorQtde[pos] ?? 0;
+            final precoUnidade = precoCheio * (1 - desconto / 100);
+            totalCiclo += precoUnidade;
+            if (desconto < 99) {
+              unidadesPagas++;
+            }
+          }
+
+          final precoMedioDescQtde = totalCiclo / quantidadeMaxima;
+
+          // SO considera desconto quantidade se for MELHOR que o preco praticado (promocional)
+          // Margem de 0.01 para evitar problemas de arredondamento
+          if (precoMedioDescQtde < (precoPraticado - 0.01)) {
+            temDescontoQuantidade = true;
+            precoUnitarioComDescQtde = precoMedioDescQtde;
+            qtdeMinimaDesconto = quantidadeMaxima;
+            descontoQtdePercentual = precoCheio > 0
+                ? ((precoCheio - precoUnitarioComDescQtde) / precoCheio * 100)
+                : 0;
+
+            if (ultimaUnidadeGratis) {
+              tipoDescontoQtde = 'caixa_gratis';
+              textoDescontoQtde = 'LEVE $quantidadeMaxima PAGUE $unidadesPagas';
+            } else {
+              tipoDescontoQtde = 'progressivo';
+              textoDescontoQtde = 'LEVE $quantidadeMaxima c/ ${descontoQtdePercentual.toStringAsFixed(0)}% OFF';
+            }
+          }
+          // Se preco praticado for melhor ou igual, nao destaca desconto quantidade
+        }
+
+        // Se precisa filtrar por desconto, pular produtos sem NENHUM tipo de desconto
+        // (considera promocional OU desconto quantidade)
+        if (filtrarDesconto && !isPromocional && !temDescontoQuantidade) {
+          produtosSemDesconto++;
+          continue;
         }
 
         produtos.add({
           'produtoId': produtoId,
-          'descricao': row['descricao']?.toString() ?? '',
+          'descricao': descricao,
           'barras': row['barras']?.toString() ?? '',
           'fabricanteNome': row['fabricante_nome']?.toString() ?? '',
           'estoque': (row['estoque'] as num?)?.toInt() ?? 0,
@@ -1682,7 +1799,24 @@ class DatabaseService {
           'precoCheio': precoCheio,
           'origemPreco': origemPreco,
           'isPromocional': isPromocional,
+          'dataFimPromocao': dataFimPromocao?.toIso8601String(),
+          'diasRestantesPromocao': diasRestantesPromocao,
+          'temDescontoQuantidade': temDescontoQuantidade,
+          'tipoDescontoQtde': tipoDescontoQtde,
+          'qtdeCaixaGratis': qtdeCaixaGratis,
+          'precoUnitarioComDescQtde': precoUnitarioComDescQtde,
+          'descontoQtdePercentual': descontoQtdePercentual,
+          'qtdeMinimaDesconto': qtdeMinimaDesconto,
+          'textoDescontoQtde': textoDescontoQtde,
         });
+
+        // Parar quando atingir o limite desejado
+        if (produtos.length >= limite) break;
+      }
+
+      debugPrint('[Carrossel DB] Produtos com desconto encontrados: ${produtos.length}');
+      if (filtrarDesconto) {
+        debugPrint('[Carrossel DB] Produtos pulados (sem desconto): $produtosSemDesconto');
       }
 
       return produtos;
@@ -1702,5 +1836,102 @@ class DatabaseService {
       resultado = resultado.replaceAll(comAcento[i], semAcento[i]);
     }
     return resultado.toLowerCase().trim();
+  }
+
+  /// Busca configuracao PEC do banco de dados
+  /// Retorna dados da operadora configurada (URL, codAcesso, senha) + CNPJ da filial
+  static Future<Map<String, dynamic>?> getConfiguracaoPec() async {
+    try {
+      final conn = await getConnection();
+      if (conn == null) {
+        debugPrint('[PEC Config] Conexao nula');
+        return null;
+      }
+
+      // Buscar primeira empresa que tem operadoras_id configurado
+      // Faz JOIN com operadoras para obter dados de conexao
+      final results = await conn.query('''
+        SELECT
+          e.empresa_id,
+          e.nome as empresa_nome,
+          e.codempadm,
+          o.operadoras_id,
+          o.descricao as operadora_nome,
+          o.pathwebservice,
+          o.CODFORNECEDORADM,
+          o.SENHAFORNECEDORADM
+        FROM empresa e
+        INNER JOIN operadoras o ON o.operadoras_id = e.operadoras_id
+        WHERE e.apagado = 'N'
+          AND e.operadoras_id IS NOT NULL
+          AND e.operadoras_id > 0
+        ORDER BY e.empresa_id
+        LIMIT 1
+      ''');
+
+      if (results.isEmpty) {
+        debugPrint('[PEC Config] Nenhuma empresa com PEC configurado');
+        return null;
+      }
+
+      final row = results.first;
+      var pathwebservice = row['pathwebservice']?.toString() ?? '';
+      final codFornecedor = row['CODFORNECEDORADM']?.toString() ?? '';
+      final senhaFornecedor = row['SENHAFORNECEDORADM']?.toString() ?? '';
+      final operadoraNome = row['operadora_nome']?.toString() ?? '';
+      final empresaNome = row['empresa_nome']?.toString() ?? '';
+      final codEmpAdm = (row['codempadm'] as num?)?.toInt() ?? 0;
+      // Credenciais LGPD - usar valores default (padrao do Tela de Vendas)
+      const lgpdId = '0c3964a3-0c24-4d01-b380-bef035326744';
+      const lgpdSenha = '220a4077-2f71-408c-be0e-8bd35cbba547';
+
+      // Limpar URL (mesmo tratamento do Tela de Vendas)
+      pathwebservice = pathwebservice.trim();
+      pathwebservice = pathwebservice.replaceAll(r'\/', '/').replaceAll(r'\\', '/');
+      if (pathwebservice.endsWith('/')) {
+        pathwebservice = pathwebservice.substring(0, pathwebservice.length - 1);
+      }
+      // Forcar HTTPS (API redireciona HTTP para HTTPS)
+      if (pathwebservice.startsWith('http://')) {
+        pathwebservice = pathwebservice.replaceFirst('http://', 'https://');
+      }
+
+      debugPrint('[PEC Config] Encontrado: Empresa "$empresaNome", Operadora "$operadoraNome"');
+      debugPrint('[PEC Config] URL: $pathwebservice');
+
+      // Buscar CNPJ da filial (coluna cgc)
+      String? cnpj;
+      if (_filialId != null) {
+        final cnpjResults = await conn.query('''
+          SELECT cgc FROM filial WHERE filial_id = ? LIMIT 1
+        ''', [_filialId]);
+
+        if (cnpjResults.isNotEmpty) {
+          final cnpjRaw = cnpjResults.first['cgc']?.toString() ?? '';
+          cnpj = cnpjRaw.replaceAll(RegExp(r'[^0-9]'), '');
+          debugPrint('[PEC Config] CNPJ filial: $cnpj');
+        }
+      }
+
+      return {
+        'urlEndpoint': pathwebservice,
+        'codAcesso': codFornecedor,
+        'senha': senhaFornecedor,
+        'cnpj': cnpj ?? '',
+        'operador': 'SISTEMABIG [3.41.0.0]', // Mesmo operador do Tela de Vendas
+        'numBalconista': '1', // Deve ser >= 1 (PositiveInteger)
+        'empresaId': codEmpAdm, // ID da empresa no PEC (codempadm)
+        'lgpdId': lgpdId,
+        'lgpdSenha': lgpdSenha,
+      };
+    } catch (e) {
+      debugPrint('[PEC Config] Erro ao buscar configuracao: $e');
+      return null;
+    }
+  }
+
+  /// Helper para obter conexao (uso interno)
+  static Future<MySqlConnection?> _getConnection() async {
+    return await getConnection();
   }
 }

@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -7,9 +6,12 @@ import 'package:intl/intl.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
+import '../models/grupo_exibicao.dart';
+import '../models/pec_models.dart';
 import '../services/beep_service.dart';
 import '../services/config_service.dart';
 import '../services/database_service.dart';
+import '../services/pec_service.dart';
 import 'config_screen.dart';
 
 class PriceScannerScreen extends StatefulWidget {
@@ -19,7 +21,8 @@ class PriceScannerScreen extends StatefulWidget {
   State<PriceScannerScreen> createState() => _PriceScannerScreenState();
 }
 
-class _PriceScannerScreenState extends State<PriceScannerScreen> {
+class _PriceScannerScreenState extends State<PriceScannerScreen>
+    with SingleTickerProviderStateMixin {
   // Controlador da camera
   MobileScannerController? _scannerController;
   bool _cameraAtiva = false;
@@ -27,14 +30,6 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
 
   // Zoom da camera
   double _zoomLevel = 0.0;
-
-  // Timer de inatividade da camera (20 segundos)
-  Timer? _inactivityTimer;
-  static const Duration _inactivityTimeout = Duration(seconds: 20);
-
-  // Contagem regressiva visivel (camera)
-  int _secondsRemaining = 0;
-  Timer? _countdownTimer;
 
   // Timer para limpar produto da tela (60 segundos)
   Timer? _productDisplayTimer;
@@ -48,15 +43,25 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
   // Mensagem de leitura de codigo
   bool _lendoCodigo = false;
 
+  // Modo de busca (true = camera, false = pesquisa por nome)
+  bool _modoBuscaCamera = true;
+
+  // Animacao pulsante para botao de pesquisa
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnimation;
+
   // Pesquisa
   final _pesquisaController = TextEditingController();
   final _pesquisaFocusNode = FocusNode();
   List<Map<String, dynamic>> _resultadosPesquisa = [];
   bool _pesquisando = false;
-  bool _mostrarPesquisa = false;
   Timer? _debounceTimer;
   static const int _minCaracteresParaPesquisa = 2;
   static const Duration _debounceDelay = Duration(milliseconds: 400);
+
+  // Timer de inatividade da pesquisa (30 segundos para voltar para camera)
+  Timer? _pesquisaInactivityTimer;
+  static const Duration _pesquisaInactivityTimeout = Duration(seconds: 30);
 
   // Reconhecimento de voz
   final stt.SpeechToText _speech = stt.SpeechToText();
@@ -69,22 +74,249 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
   // Formatador de moeda
   final _currencyFormat = NumberFormat.currency(locale: 'pt_BR', symbol: 'R\$');
 
+  // Carrossel de promocoes (ticker na parte inferior)
+  List<Map<String, dynamic>> _produtosCarrossel = [];
+  ScrollController? _carrosselScrollController;
+  Timer? _carrosselTimer;
+  Timer? _carrosselRefreshTimer;
+  bool _carrosselAtivo = false;
+  static const Duration _carrosselRefreshInterval = Duration(seconds: 60);
+
+  // PEC (Programa de Economia Colaborativa)
+  PecService? _pecService;
+  bool _pecAtivo = false;
+  ResultadoConsultaPec? _resultadoPec;
+  bool _consultandoPec = false;
+
   @override
   void initState() {
     super.initState();
     _carregarConfiguracoes();
     _inicializarReconhecimentoVoz();
+    _inicializarCarrossel();
     // Adicionar listener para pesquisa automatica
     _pesquisaController.addListener(_onSearchChanged);
+
+    // Inicializar animacao pulsante
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1200),
+    );
+    _pulseAnimation = Tween<double>(begin: 0.85, end: 1.0).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+    _pulseController.repeat(reverse: true);
+  }
+
+  /// Inicializa o carrossel de promocoes
+  Future<void> _inicializarCarrossel() async {
+    debugPrint('[Carrossel] Inicializando carrossel...');
+    _carrosselScrollController = ScrollController();
+    await _carregarProdutosCarrossel();
+    _iniciarAnimacaoCarrossel();
+    _iniciarRefreshCarrossel();
+    debugPrint('[Carrossel] Inicializacao concluida. Produtos: ${_produtosCarrossel.length}');
+  }
+
+  /// Inicia o timer de atualizacao automatica do carrossel (a cada 60 segundos)
+  void _iniciarRefreshCarrossel() {
+    _carrosselRefreshTimer?.cancel();
+    _carrosselRefreshTimer = Timer.periodic(_carrosselRefreshInterval, (_) async {
+      if (mounted && _carrosselAtivo) {
+        debugPrint('[Carrossel] Atualizando produtos automaticamente...');
+        await _carregarProdutosCarrossel();
+        if (mounted) {
+          setState(() {});
+          debugPrint('[Carrossel] Atualizacao concluida. Produtos: ${_produtosCarrossel.length}');
+        }
+      }
+    });
+  }
+
+  /// Carrega os produtos para o carrossel baseado nos grupos configurados
+  Future<void> _carregarProdutosCarrossel() async {
+    try {
+      debugPrint('[Carrossel] Iniciando carregamento de produtos...');
+
+      // Verificar se carrossel esta ativo
+      _carrosselAtivo = await ConfigService.isCarrosselAtivo();
+      debugPrint('[Carrossel] Carrossel ativo: $_carrosselAtivo');
+      if (!_carrosselAtivo) {
+        debugPrint('[Carrossel] Carrossel DESATIVADO nas configuracoes. Abortando.');
+        return;
+      }
+
+      // Buscar grupos de exibicao ativos
+      final grupos = await ConfigService.getGruposExibicao();
+      debugPrint('[Carrossel] Total de grupos configurados: ${grupos.length}');
+      final gruposAtivos = grupos.where((g) => g.ativo).toList();
+      debugPrint('[Carrossel] Grupos ativos: ${gruposAtivos.length}');
+
+      if (gruposAtivos.isEmpty) {
+        debugPrint('[Carrossel] Nenhum grupo ativo encontrado. Abortando.');
+        return;
+      }
+
+      List<Map<String, dynamic>> todosProdutos = [];
+
+      // Buscar produtos de cada grupo
+      for (final grupo in gruposAtivos) {
+        debugPrint('[Carrossel] Processando grupo: ${grupo.nome} (${grupo.tipo})');
+        debugPrint('[Carrossel]   IDs: ${grupo.idsItens}');
+
+        // Converter enum para string do banco
+        String tipoFiltro;
+        switch (grupo.tipo) {
+          case TipoFiltroGrupo.grupo:
+            tipoFiltro = 'grupo';
+            break;
+          case TipoFiltroGrupo.especificacao:
+            tipoFiltro = 'especificacao';
+            break;
+          case TipoFiltroGrupo.principioAtivo:
+            tipoFiltro = 'principio_ativo';
+            break;
+        }
+
+        String filtroEstoque;
+        switch (grupo.filtro) {
+          case FiltroEstoqueDesconto.todos:
+            filtroEstoque = 'todos';
+            break;
+          case FiltroEstoqueDesconto.somenteEstoque:
+            filtroEstoque = 'estoque';
+            break;
+          case FiltroEstoqueDesconto.somenteDesconto:
+            filtroEstoque = 'desconto';
+            break;
+          case FiltroEstoqueDesconto.estoqueEDesconto:
+            filtroEstoque = 'estoque_desconto';
+            break;
+        }
+
+        debugPrint('[Carrossel]   tipoFiltro: $tipoFiltro, filtroEstoque: $filtroEstoque');
+
+        final produtos = await DatabaseService.buscarProdutosParaCarrossel(
+          tipoFiltro: tipoFiltro,
+          ids: grupo.idsItens,
+          filtroEstoqueDesconto: filtroEstoque,
+          tabelaDescontoId: _tabelaDescontoId,
+          limite: 20,
+        );
+        debugPrint('[Carrossel]   Produtos encontrados: ${produtos.length}');
+        todosProdutos.addAll(produtos);
+      }
+
+      // Embaralhar para exibicao aleatoria
+      todosProdutos.shuffle();
+
+      debugPrint('[Carrossel] TOTAL de produtos carregados: ${todosProdutos.length}');
+
+      if (mounted) {
+        setState(() {
+          _produtosCarrossel = todosProdutos;
+        });
+        debugPrint('[Carrossel] setState chamado. _produtosCarrossel.length = ${_produtosCarrossel.length}');
+      }
+    } catch (e, stackTrace) {
+      debugPrint('[Carrossel] ERRO ao carregar produtos: $e');
+      debugPrint('[Carrossel] StackTrace: $stackTrace');
+    }
+  }
+
+  /// Inicia a animacao do carrossel (scroll automatico)
+  void _iniciarAnimacaoCarrossel() {
+    _carrosselTimer?.cancel();
+
+    debugPrint('[Carrossel] Tentando iniciar animacao. Produtos: ${_produtosCarrossel.length}');
+
+    if (_produtosCarrossel.isEmpty) {
+      debugPrint('[Carrossel] Lista vazia, animacao NAO iniciada.');
+      return;
+    }
+
+    debugPrint('[Carrossel] Iniciando timer de animacao...');
+    _carrosselTimer = Timer.periodic(const Duration(milliseconds: 50), (timer) {
+      if (_carrosselScrollController != null &&
+          _carrosselScrollController!.hasClients &&
+          mounted) {
+        final maxScroll = _carrosselScrollController!.position.maxScrollExtent;
+        final currentScroll = _carrosselScrollController!.offset;
+
+        if (currentScroll >= maxScroll) {
+          // Voltar ao inicio
+          _carrosselScrollController!.jumpTo(0);
+        } else {
+          // Scroll suave
+          _carrosselScrollController!.jumpTo(currentScroll + 1);
+        }
+      }
+    });
   }
 
   Future<void> _carregarConfiguracoes() async {
     _tabelaDescontoId = await ConfigService.getTabelaDescontoId();
 
+    // Carregar configuracao PEC
+    _pecAtivo = await ConfigService.isPecAtivo();
+    if (_pecAtivo) {
+      final cartaoPec = await ConfigService.getCartaoPec();
+      if (cartaoPec != null && cartaoPec.isNotEmpty) {
+        // Buscar configuracao PEC do banco de dados (operadoras)
+        final pecConfigDb = await DatabaseService.getConfiguracaoPec();
+        if (pecConfigDb != null) {
+          final urlEndpoint = pecConfigDb['urlEndpoint'] as String? ?? '';
+          final codAcesso = pecConfigDb['codAcesso'] as String? ?? '';
+          final senha = pecConfigDb['senha'] as String? ?? '';
+          final cnpj = pecConfigDb['cnpj'] as String? ?? '';
+          final operador = pecConfigDb['operador'] as String? ?? 'SISTEMABIG [3.41.0.0]';
+          final numBalconistaStr = pecConfigDb['numBalconista'] as String? ?? '1';
+          final numBalconista = int.tryParse(numBalconistaStr) ?? 1;
+          final empresaId = pecConfigDb['empresaId'] as int? ?? 0;
+          final lgpdId = pecConfigDb['lgpdId'] as String? ?? '';
+          final lgpdSenha = pecConfigDb['lgpdSenha'] as String? ?? '';
+
+          if (urlEndpoint.isNotEmpty && codAcesso.isNotEmpty) {
+            final pecConfig = ConfiguracaoPec(
+              urlEndpoint: urlEndpoint,
+              codAcesso: codAcesso,
+              senha: senha,
+              cnpj: cnpj,
+              cartaoPec: cartaoPec,
+              operador: operador,
+              numBalconista: numBalconista,
+              empresaId: empresaId,
+              lgpdId: lgpdId,
+              lgpdSenha: lgpdSenha,
+            );
+            _pecService = PecService(pecConfig);
+            debugPrint('[PEC] Servico PEC inicializado. Cartao/CPF: $cartaoPec, CNPJ: $cnpj, EmpresaId: $empresaId');
+            debugPrint('[PEC] URL: $urlEndpoint');
+          } else {
+            debugPrint('[PEC] Configuracao PEC incompleta no banco, PEC desativado');
+            _pecAtivo = false;
+          }
+        } else {
+          debugPrint('[PEC] Nenhuma operadora PEC configurada no banco, PEC desativado');
+          _pecAtivo = false;
+        }
+      } else {
+        debugPrint('[PEC] Cartao PEC nao configurado, PEC desativado');
+        _pecAtivo = false;
+      }
+    }
+
     // Verificar se tem configuracao
     final hasConfig = await ConfigService.hasConfig();
     if (!hasConfig && mounted) {
       _abrirConfiguracoes();
+    } else if (mounted && _modoBuscaCamera) {
+      // Ativar camera automaticamente no modo camera
+      Future.delayed(const Duration(milliseconds: 300), () {
+        if (mounted && _modoBuscaCamera && !_cameraAtiva) {
+          _ativarCamera();
+        }
+      });
     }
   }
 
@@ -166,12 +398,9 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
   void _ativarCamera() {
     if (_cameraAtiva) return;
 
-    // Fechar pesquisa se estiver aberta
     setState(() {
-      _mostrarPesquisa = false;
       _cameraAtiva = true;
-      _secondsRemaining = _inactivityTimeout.inSeconds;
-      _zoomLevel = 0.0;
+      _zoomLevel = 0.7; // Zoom inicial de 70%
     });
 
     _scannerController = MobileScannerController(
@@ -179,20 +408,31 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
       detectionSpeed: DetectionSpeed.normal,
     );
 
-    _iniciarTimerInatividade();
-    _iniciarContadorRegressivo();
+    // Aplicar zoom inicial apos a camera inicializar (multiplas tentativas)
+    _aplicarZoomInicial();
+  }
+
+  /// Aplica o zoom inicial com retry para garantir que a camera esta pronta
+  void _aplicarZoomInicial() async {
+    for (int i = 0; i < 5; i++) {
+      await Future.delayed(const Duration(milliseconds: 300));
+      if (_scannerController != null && mounted) {
+        try {
+          await _scannerController!.setZoomScale(0.7);
+          break; // Sucesso, sair do loop
+        } catch (e) {
+          // Camera ainda nao pronta, tentar novamente
+        }
+      }
+    }
   }
 
   void _desativarCamera() {
-    _inactivityTimer?.cancel();
-    _countdownTimer?.cancel();
-
     _scannerController?.dispose();
     _scannerController = null;
 
     setState(() {
       _cameraAtiva = false;
-      _secondsRemaining = 0;
     });
   }
 
@@ -201,38 +441,6 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
       _zoomLevel = value;
     });
     _scannerController?.setZoomScale(value);
-  }
-
-  void _iniciarTimerInatividade() {
-    _inactivityTimer?.cancel();
-    _inactivityTimer = Timer(_inactivityTimeout, () {
-      // Tempo esgotado - desativar camera e limpar produto
-      _desativarCamera();
-      setState(() {
-        _produtoAtual = null;
-        _mensagemErro = null;
-      });
-    });
-  }
-
-  void _iniciarContadorRegressivo() {
-    _countdownTimer?.cancel();
-    _secondsRemaining = _inactivityTimeout.inSeconds;
-
-    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      if (_secondsRemaining > 0) {
-        setState(() {
-          _secondsRemaining--;
-        });
-      } else {
-        timer.cancel();
-      }
-    });
-  }
-
-  void _reiniciarTimers() {
-    _iniciarTimerInatividade();
-    _iniciarContadorRegressivo();
   }
 
   /// Inicia o timer de exibicao do produto (60 segundos)
@@ -268,9 +476,6 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
     // Tocar BIP de leitura imediatamente
     BeepService.playSuccess();
 
-    // Reiniciar timers ao detectar codigo
-    _reiniciarTimers();
-
     // Aguardar um momento para mostrar a mensagem de "Lendo codigo de barras"
     await Future.delayed(const Duration(milliseconds: 800));
 
@@ -290,6 +495,9 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
 
     if (!mounted) return;
 
+    // Limpar resultado PEC anterior
+    _resultadoPec = null;
+
     setState(() {
       _carregandoProduto = false;
 
@@ -301,6 +509,11 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
         _mensagemErro = resultado['erro'] ?? 'Erro ao buscar produto';
       }
     });
+
+    // Consultar PEC se produto encontrado e PEC ativo
+    if (resultado['sucesso'] == true && _pecAtivo && _pecService != null) {
+      _consultarPec(resultado);
+    }
 
     // Iniciar timer de 60 segundos para limpar o produto da tela
     if (resultado['sucesso'] == true) {
@@ -317,22 +530,107 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
     }
   }
 
+  // ========== PEC ==========
+
+  /// Consulta desconto PEC para o produto
+  Future<void> _consultarPec(Map<String, dynamic> produto) async {
+    if (_pecService == null || !_pecAtivo) return;
+
+    final barras = produto['barras']?.toString() ?? '';
+    final descricao = produto['descricao']?.toString() ?? '';
+    final precoCheio = (produto['precoCheio'] as num?)?.toDouble() ?? 0;
+    final precoFabrica = (produto['precoFabrica'] as num?)?.toDouble() ?? precoCheio * 0.7;
+    final grupoId = (produto['grupoId'] as num?)?.toInt() ?? 0;
+
+    if (barras.isEmpty || precoCheio <= 0) return;
+
+    setState(() => _consultandoPec = true);
+
+    try {
+      debugPrint('[PEC] Consultando produto: $barras');
+
+      final resultado = await _pecService!.consultarProduto(
+        codBarras: barras,
+        descricao: descricao,
+        precoVenda: precoCheio,
+        precoFabrica: precoFabrica,
+        grupoId: grupoId,
+      );
+
+      if (mounted) {
+        setState(() {
+          _resultadoPec = resultado;
+          _consultandoPec = false;
+        });
+
+        if (resultado.temDesconto) {
+          debugPrint('[PEC] Desconto encontrado: ${resultado.descontoPercentual}% - ${resultado.nomePrograma}');
+        } else if (resultado.consultado) {
+          debugPrint('[PEC] Produto consultado, sem desconto');
+        } else {
+          debugPrint('[PEC] Erro na consulta: ${resultado.erro}');
+        }
+      }
+    } catch (e) {
+      debugPrint('[PEC] Erro: $e');
+      if (mounted) {
+        setState(() {
+          _resultadoPec = ResultadoConsultaPec.erro(e.toString());
+          _consultandoPec = false;
+        });
+      }
+    }
+  }
+
   // ========== PESQUISA ==========
 
-  void _togglePesquisa() {
+  /// Alterna entre modo camera e modo pesquisa
+  void _alternarModoBusca() {
     setState(() {
-      _mostrarPesquisa = !_mostrarPesquisa;
-      if (_mostrarPesquisa) {
-        _desativarCamera();
-        // Focar no campo de pesquisa
-        Future.delayed(const Duration(milliseconds: 100), () {
-          _pesquisaFocusNode.requestFocus();
-        });
-      } else {
+      _modoBuscaCamera = !_modoBuscaCamera;
+
+      if (_modoBuscaCamera) {
+        // Voltando para modo camera
         _pesquisaController.clear();
         _resultadosPesquisa = [];
+        _cancelarTimerPesquisa();
+        _ativarCamera();
+      } else {
+        // Entrando no modo pesquisa
+        _desativarCamera();
+        _iniciarTimerPesquisa();
+        // Iniciar pesquisa por voz automaticamente
+        Future.delayed(const Duration(milliseconds: 300), () {
+          if (mounted && !_modoBuscaCamera && _speechDisponivel) {
+            _toggleReconhecimentoVoz();
+          }
+        });
       }
     });
+  }
+
+  /// Inicia o timer de inatividade da pesquisa
+  void _iniciarTimerPesquisa() {
+    _cancelarTimerPesquisa();
+    _pesquisaInactivityTimer = Timer(_pesquisaInactivityTimeout, () {
+      if (mounted && !_modoBuscaCamera) {
+        // Voltar para modo camera apos inatividade
+        _alternarModoBusca();
+      }
+    });
+  }
+
+  /// Cancela o timer de inatividade da pesquisa
+  void _cancelarTimerPesquisa() {
+    _pesquisaInactivityTimer?.cancel();
+    _pesquisaInactivityTimer = null;
+  }
+
+  /// Reinicia o timer de pesquisa (chamado ao tocar na tela)
+  void _reiniciarTimerPesquisa() {
+    if (!_modoBuscaCamera) {
+      _iniciarTimerPesquisa();
+    }
   }
 
   /// Listener acionado pelo teclado no campo de pesquisa
@@ -402,7 +700,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
   /// Seleciona um produto da pesquisa e busca detalhes completos
   Future<void> _selecionarProduto(Map<String, dynamic> produto) async {
     setState(() {
-      _mostrarPesquisa = false;
+      _modoBuscaCamera = true;
       _pesquisaController.clear();
       _resultadosPesquisa = [];
       _carregandoProduto = true;
@@ -421,18 +719,31 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
           _produtoAtual = detalhes;
           _carregandoProduto = false;
         });
+
+        // Consultar PEC se produto encontrado e PEC ativo
+        if (detalhes['sucesso'] == true && _pecAtivo && _pecService != null) {
+          _consultarPec(detalhes);
+        }
+
         // Iniciar timer de 60 segundos para limpar o produto da tela
         _iniciarTimerProduto();
       }
     } else {
       // Fallback para dados basicos se nao tiver barras
+      final detalhesBasicos = {
+        'sucesso': true,
+        ...produto,
+      };
       setState(() {
-        _produtoAtual = {
-          'sucesso': true,
-          ...produto,
-        };
+        _produtoAtual = detalhesBasicos;
         _carregandoProduto = false;
       });
+
+      // Consultar PEC se PEC ativo (mesmo sem barras, tenta com dados basicos)
+      if (_pecAtivo && _pecService != null) {
+        _consultarPec(detalhesBasicos);
+      }
+
       // Iniciar timer de 60 segundos para limpar o produto da tela
       _iniciarTimerProduto();
     }
@@ -442,20 +753,24 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
 
   @override
   void dispose() {
-    _inactivityTimer?.cancel();
-    _countdownTimer?.cancel();
     _productDisplayTimer?.cancel();
     _debounceTimer?.cancel();
+    _pesquisaInactivityTimer?.cancel();
+    _carrosselTimer?.cancel();
+    _carrosselRefreshTimer?.cancel();
+    _carrosselScrollController?.dispose();
     _scannerController?.dispose();
     _pesquisaController.removeListener(_onSearchChanged);
     _pesquisaController.dispose();
     _pesquisaFocusNode.dispose();
+    _pulseController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+    final isLandscape =
+        MediaQuery.of(context).orientation == Orientation.landscape;
 
     return Scaffold(
       backgroundColor: const Color(0xFF0D47A1),
@@ -476,341 +791,13 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
           ],
         ),
         actions: [
-          // Botao de pesquisa
-          IconButton(
-            icon: Icon(
-              _mostrarPesquisa ? Icons.close : Icons.search,
-              color: Colors.white,
-            ),
-            onPressed: _togglePesquisa,
-            tooltip: 'Pesquisar produto',
-          ),
           IconButton(
             icon: const Icon(Icons.settings, color: Colors.white),
             onPressed: _abrirConfiguracoes,
           ),
         ],
       ),
-      body: _mostrarPesquisa
-          ? _buildPesquisaView()
-          : (isLandscape ? _buildLandscapeLayout() : _buildPortraitLayout()),
-    );
-  }
-
-  /// View de pesquisa
-  Widget _buildPesquisaView() {
-    return Column(
-      children: [
-        // Campo de pesquisa
-        Container(
-          padding: const EdgeInsets.all(16),
-          color: const Color(0xFF1565C0),
-          child: Column(
-            children: [
-              // Campo de texto com botao de microfone ao lado
-              Row(
-                children: [
-                  // Campo de pesquisa
-                  Expanded(
-                    child: TextField(
-                      controller: _pesquisaController,
-                      focusNode: _pesquisaFocusNode,
-                      style: const TextStyle(color: Colors.white, fontSize: 18),
-                      decoration: InputDecoration(
-                        hintText: 'Digite o nome do produto...',
-                        hintStyle: TextStyle(color: Colors.white.withValues(alpha: 0.6)),
-                        prefixIcon: const Icon(Icons.search, color: Colors.white, size: 28),
-                        suffixIcon: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            // Loading ou botao limpar
-                            if (_pesquisando)
-                              const Padding(
-                                padding: EdgeInsets.all(12),
-                                child: SizedBox(
-                                  width: 24,
-                                  height: 24,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    color: Colors.white,
-                                  ),
-                                ),
-                              )
-                            else if (_pesquisaController.text.isNotEmpty)
-                              IconButton(
-                                icon: const Icon(Icons.clear, color: Colors.white, size: 24),
-                                onPressed: () {
-                                  _pesquisaController.clear();
-                                },
-                              ),
-                          ],
-                        ),
-                        filled: true,
-                        fillColor: Colors.white.withValues(alpha: 0.2),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(16),
-                          borderSide: BorderSide.none,
-                        ),
-                        contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
-                      ),
-                      textInputAction: TextInputAction.search,
-                      onSubmitted: (_) => _executarPesquisa(),
-                      onChanged: (value) {
-                        setState(() {});
-                      },
-                    ),
-                  ),
-                  // Botao grande de microfone
-                  if (_speechDisponivel) ...[
-                    const SizedBox(width: 12),
-                    _buildMicrophoneButton(),
-                  ],
-                ],
-              ),
-              // Indicador de escuta por voz (animado e chamativo)
-              if (_ouvindo)
-                Container(
-                  margin: const EdgeInsets.only(top: 12),
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-                  decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      colors: [Colors.red.shade400, Colors.red.shade600],
-                    ),
-                    borderRadius: BorderRadius.circular(30),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.red.withValues(alpha: 0.4),
-                        blurRadius: 12,
-                        spreadRadius: 2,
-                      ),
-                    ],
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.graphic_eq, color: Colors.white, size: 28),
-                      const SizedBox(width: 10),
-                      Text(
-                        'Ouvindo... Fale o nome do produto',
-                        style: GoogleFonts.roboto(
-                          color: Colors.white,
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ],
-                  ),
-                )
-              // Dica de uso
-              else if (_pesquisaController.text.isEmpty)
-                Padding(
-                  padding: const EdgeInsets.only(top: 10),
-                  child: Text(
-                    'Digite ou toque no microfone para pesquisar por voz',
-                    style: TextStyle(
-                      color: Colors.white.withValues(alpha: 0.7),
-                      fontSize: 13,
-                    ),
-                  ),
-                ),
-            ],
-          ),
-        ),
-
-        // Resultados
-        Expanded(
-          child: _resultadosPesquisa.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(
-                        _pesquisaController.text.length < _minCaracteresParaPesquisa
-                            ? Icons.keyboard
-                            : Icons.search_off,
-                        size: 48,
-                        color: Colors.white.withValues(alpha: 0.3),
-                      ),
-                      const SizedBox(height: 12),
-                      Text(
-                        _pesquisaController.text.length < _minCaracteresParaPesquisa
-                            ? 'Digite pelo menos $_minCaracteresParaPesquisa caracteres'
-                            : 'Nenhum produto encontrado',
-                        style: TextStyle(
-                          color: Colors.white.withValues(alpha: 0.6),
-                          fontSize: 16,
-                        ),
-                      ),
-                    ],
-                  ),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.all(8),
-                  itemCount: _resultadosPesquisa.length,
-                  itemBuilder: (context, index) {
-                    final produto = _resultadosPesquisa[index];
-                    return _buildProdutoListItem(produto);
-                  },
-                ),
-        ),
-      ],
-    );
-  }
-
-  Widget _buildProdutoListItem(Map<String, dynamic> produto) {
-    final descricao = produto['descricao'] ?? '';
-    final fabricante = produto['fabricanteNome'] ?? '';
-    final estoque = (produto['estoque'] as num?)?.toInt() ?? 0;
-    final temDescQtde = produto['temDescontoQuantidade'] == true;
-    final origemPreco = produto['origemPreco'] ?? 'NORMAL';
-    final isTabloide = origemPreco.toString().toUpperCase().contains('TABLOIDE');
-    final isPromo = produto['isPromocional'] == true;
-    final temCombo = produto['temCombo'] == true;
-
-    return Card(
-      margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-      color: estoque <= 0 ? Colors.grey.shade200 : Colors.white,
-      child: InkWell(
-        onTap: () => _selecionarProduto(produto),
-        borderRadius: BorderRadius.circular(12),
-        child: Padding(
-          padding: const EdgeInsets.all(12),
-          child: Row(
-            children: [
-              // Informacoes do produto
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // Badges no topo
-                    if (temDescQtde || isTabloide || isPromo || temCombo)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 4),
-                        child: Wrap(
-                          spacing: 4,
-                          children: [
-                            if (isPromo)
-                              _buildMiniBadge('PROMO', Colors.green.shade600),
-                            if (isTabloide)
-                              _buildMiniBadge('TAB', Colors.pink.shade600),
-                            if (temDescQtde)
-                              _buildMiniBadge('QTD', Colors.purple.shade600),
-                            if (temCombo)
-                              _buildMiniBadge('COMBO', Colors.orange.shade600),
-                          ],
-                        ),
-                      ),
-                    // Nome do produto
-                    Text(
-                      descricao,
-                      style: TextStyle(
-                        fontWeight: FontWeight.bold,
-                        fontSize: 14,
-                        color: estoque <= 0 ? Colors.grey.shade600 : Colors.grey.shade800,
-                      ),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                    if (fabricante.isNotEmpty)
-                      Text(
-                        fabricante,
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.grey.shade600,
-                        ),
-                      ),
-                    // Estoque
-                    Row(
-                      children: [
-                        Icon(
-                          estoque > 0 ? Icons.check_circle : Icons.cancel,
-                          size: 12,
-                          color: estoque > 0 ? Colors.green.shade600 : Colors.red.shade400,
-                        ),
-                        const SizedBox(width: 4),
-                        Text(
-                          estoque > 0 ? 'Estoque: $estoque' : 'Sem estoque',
-                          style: TextStyle(
-                            fontSize: 11,
-                            color: estoque > 0 ? Colors.green.shade600 : Colors.red.shade400,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-              ),
-              // Seta para indicar clique
-              Container(
-                padding: const EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.grey.shade100,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: Icon(
-                  Icons.arrow_forward_ios,
-                  size: 16,
-                  color: Colors.grey.shade600,
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// Botao grande e chamativo de microfone para pesquisa por voz
-  Widget _buildMicrophoneButton() {
-    return GestureDetector(
-      onTap: _toggleReconhecimentoVoz,
-      child: AnimatedContainer(
-        duration: const Duration(milliseconds: 200),
-        width: 64,
-        height: 64,
-        decoration: BoxDecoration(
-          gradient: LinearGradient(
-            begin: Alignment.topLeft,
-            end: Alignment.bottomRight,
-            colors: _ouvindo
-                ? [Colors.red.shade400, Colors.red.shade700]
-                : [Colors.green.shade400, Colors.green.shade700],
-          ),
-          borderRadius: BorderRadius.circular(20),
-          boxShadow: [
-            BoxShadow(
-              color: (_ouvindo ? Colors.red : Colors.green).withValues(alpha: 0.5),
-              blurRadius: _ouvindo ? 16 : 10,
-              spreadRadius: _ouvindo ? 2 : 1,
-              offset: const Offset(0, 4),
-            ),
-          ],
-        ),
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            // Icone principal
-            Icon(
-              _ouvindo ? Icons.mic : Icons.mic_none,
-              color: Colors.white,
-              size: 36,
-            ),
-            // Indicador de gravacao (pulso)
-            if (_ouvindo)
-              Positioned.fill(
-                child: Container(
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(
-                      color: Colors.white.withValues(alpha: 0.5),
-                      width: 2,
-                    ),
-                  ),
-                ),
-              ),
-          ],
-        ),
-      ),
+      body: isLandscape ? _buildLandscapeLayout() : _buildPortraitLayout(),
     );
   }
 
@@ -837,10 +824,10 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
   Widget _buildLandscapeLayout() {
     return Row(
       children: [
-        // Camera na esquerda (menor)
+        // Camera/Pesquisa na esquerda
         SizedBox(
-          width: 280,
-          child: _buildCameraArea(),
+          width: 300,
+          child: _buildCameraSearchArea(),
         ),
         // Produto na direita (maior)
         Expanded(
@@ -854,64 +841,134 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
   Widget _buildPortraitLayout() {
     return Column(
       children: [
-        // Camera no topo
+        // Camera/Pesquisa no topo
         SizedBox(
-          height: 280,
-          child: _buildCameraArea(),
+          height: 320,
+          child: _buildCameraSearchArea(),
         ),
-        // Produto embaixo
+        // Produto no meio
         Expanded(
           child: _buildProductArea(),
         ),
+        // Carrossel de promocoes na parte inferior
+        if (_produtosCarrossel.isNotEmpty)
+          SizedBox(
+            height: 200,
+            child: _buildCarrosselPromocoes(),
+          ),
       ],
     );
   }
 
-  Widget _buildCameraArea() {
+  /// Widget combinado Camera/Pesquisa com flex dinamico
+  Widget _buildCameraSearchArea() {
     return Container(
       margin: const EdgeInsets.all(8),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0D47A1),
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Coluna da Camera
+          Expanded(
+            flex: _modoBuscaCamera ? 3 : 1,
+            child: _modoBuscaCamera
+                ? _buildCameraColuna()
+                : _buildCameraMinimizada(),
+          ),
+          const SizedBox(width: 4),
+          // Coluna da Pesquisa
+          Expanded(
+            flex: _modoBuscaCamera ? 1 : 3,
+            child: _modoBuscaCamera
+                ? _buildPesquisaMinimizada()
+                : _buildPesquisaColuna(),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Camera quando esta ativa (modo camera)
+  Widget _buildCameraColuna() {
+    // Ativar camera automaticamente se nao estiver ativa
+    if (!_cameraAtiva && _modoBuscaCamera) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_cameraAtiva && _modoBuscaCamera) {
+          _ativarCamera();
+        }
+      });
+    }
+
+    return Container(
       decoration: BoxDecoration(
         color: Colors.black,
         borderRadius: BorderRadius.circular(16),
         border: Border.all(
-          color: _cameraAtiva ? Colors.green : Colors.grey.shade600,
+          color: Colors.green,
           width: 3,
         ),
       ),
       clipBehavior: Clip.antiAlias,
-      child: _cameraAtiva ? _buildActiveCamera() : _buildInactiveCamera(),
+      child: _cameraAtiva ? _buildActiveCamera() : _buildCameraLoading(),
     );
   }
 
-  Widget _buildInactiveCamera() {
-    return InkWell(
-      onTap: _ativarCamera,
+  /// Tela de carregamento da camera
+  Widget _buildCameraLoading() {
+    return Container(
+      color: Colors.black,
+      child: const Center(
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            CircularProgressIndicator(color: Colors.green),
+            SizedBox(height: 12),
+            Text(
+              'Iniciando camera...',
+              style: TextStyle(color: Colors.white70, fontSize: 14),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Camera minimizada (quando pesquisa esta ativa)
+  Widget _buildCameraMinimizada() {
+    return GestureDetector(
+      onTap: _alternarModoBusca,
       child: Container(
-        color: Colors.grey.shade900,
+        decoration: BoxDecoration(
+          color: Colors.grey.shade800,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.grey.shade600, width: 2),
+        ),
         child: Center(
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Icon(
-                Icons.touch_app,
-                size: 48,
-                color: Colors.blue.shade300,
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'Toque para ativar',
-                style: GoogleFonts.roboto(
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.blue.shade700,
+                  shape: BoxShape.circle,
+                ),
+                child: const Icon(
+                  Icons.qr_code_scanner,
                   color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w500,
+                  size: 32,
                 ),
               ),
-              const SizedBox(height: 4),
+              const SizedBox(height: 8),
               Text(
-                'ou use a pesquisa',
+                'Codigo',
                 style: GoogleFonts.roboto(
-                  color: Colors.grey.shade500,
+                  color: Colors.white70,
                   fontSize: 12,
+                  fontWeight: FontWeight.w500,
                 ),
               ),
             ],
@@ -921,138 +978,362 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
     );
   }
 
-  Widget _buildActiveCamera() {
-    final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
-
-    return Stack(
-      children: [
-        // Camera com rotacao para corrigir orientacao em paisagem
-        Positioned.fill(
-          child: isLandscape
-              ? Transform.rotate(
-                  angle: -math.pi / 2, // Rotaciona 90 graus
-                  child: MobileScanner(
-                    controller: _scannerController,
-                    onDetect: _onBarcodeDetect,
+  /// Pesquisa minimizada (quando camera esta ativa) - com animacao pulsante
+  Widget _buildPesquisaMinimizada() {
+    return GestureDetector(
+      onTap: _alternarModoBusca,
+      child: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topCenter,
+            end: Alignment.bottomCenter,
+            colors: [Colors.green.shade700, Colors.green.shade900],
+          ),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.green.shade400, width: 2),
+        ),
+        child: Center(
+          child: FadeTransition(
+            opacity: _pulseAnimation,
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Container(
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.2),
+                    shape: BoxShape.circle,
                   ),
-                )
-              : MobileScanner(
+                  child: const Icon(
+                    Icons.mic,
+                    color: Colors.white,
+                    size: 32,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Pesquisar\npor nome',
+                  textAlign: TextAlign.center,
+                  style: GoogleFonts.roboto(
+                    color: Colors.white,
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    height: 1.2,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Pesquisa expandida (quando pesquisa esta ativa)
+  Widget _buildPesquisaColuna() {
+    return GestureDetector(
+      onTap: _reiniciarTimerPesquisa,
+      onPanDown: (_) => _reiniciarTimerPesquisa(),
+      child: Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF1565C0),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.blue.shade300, width: 2),
+        ),
+        clipBehavior: Clip.antiAlias,
+        child: Column(
+        children: [
+          // Campo de pesquisa compacto
+          Container(
+            padding: const EdgeInsets.all(8),
+            color: const Color(0xFF0D47A1),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _pesquisaController,
+                    focusNode: _pesquisaFocusNode,
+                    style: const TextStyle(color: Colors.white, fontSize: 14),
+                    decoration: InputDecoration(
+                      hintText: 'Digite o produto...',
+                      hintStyle: TextStyle(
+                        color: Colors.white.withValues(alpha: 0.5),
+                        fontSize: 13,
+                      ),
+                      prefixIcon:
+                          const Icon(Icons.search, color: Colors.white, size: 20),
+                      suffixIcon: _pesquisaController.text.isNotEmpty
+                          ? IconButton(
+                              icon: const Icon(Icons.clear,
+                                  color: Colors.white, size: 18),
+                              onPressed: () {
+                                _pesquisaController.clear();
+                              },
+                            )
+                          : null,
+                      filled: true,
+                      fillColor: Colors.white.withValues(alpha: 0.15),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide.none,
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 8),
+                      isDense: true,
+                    ),
+                    textInputAction: TextInputAction.search,
+                    onSubmitted: (_) => _executarPesquisa(),
+                  ),
+                ),
+                // Botao de microfone
+                if (_speechDisponivel) ...[
+                  const SizedBox(width: 6),
+                  GestureDetector(
+                    onTap: _toggleReconhecimentoVoz,
+                    child: Container(
+                      padding: const EdgeInsets.all(8),
+                      decoration: BoxDecoration(
+                        color: _ouvindo ? Colors.red : Colors.green.shade600,
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: Icon(
+                        _ouvindo ? Icons.mic : Icons.mic_none,
+                        color: Colors.white,
+                        size: 22,
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          // Indicador de escuta
+          if (_ouvindo)
+            Container(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              color: Colors.red.shade600,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.graphic_eq, color: Colors.white, size: 16),
+                  const SizedBox(width: 6),
+                  Text(
+                    'Ouvindo...',
+                    style: GoogleFonts.roboto(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          // Lista de resultados
+          Expanded(
+            child: _pesquisando
+                ? const Center(
+                    child: CircularProgressIndicator(color: Colors.white),
+                  )
+                : _resultadosPesquisa.isEmpty
+                    ? Center(
+                        child: Text(
+                          _pesquisaController.text.length < _minCaracteresParaPesquisa
+                              ? 'Digite pelo menos $_minCaracteresParaPesquisa letras'
+                              : 'Nenhum resultado',
+                          style: TextStyle(
+                            color: Colors.white.withValues(alpha: 0.5),
+                            fontSize: 12,
+                          ),
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.all(4),
+                        itemCount: _resultadosPesquisa.length,
+                        itemBuilder: (context, index) {
+                          final produto = _resultadosPesquisa[index];
+                          return _buildProdutoListItemCompacto(produto);
+                        },
+                      ),
+          ),
+        ],
+        ),
+      ),
+    );
+  }
+
+  /// Item compacto da lista de produtos na pesquisa
+  Widget _buildProdutoListItemCompacto(Map<String, dynamic> produto) {
+    final descricao = produto['descricao'] ?? '';
+    final estoque = (produto['estoque'] as num?)?.toInt() ?? 0;
+    final temDescQtde = produto['temDescontoQuantidade'] == true;
+    final isPromo = produto['isPromocional'] == true;
+
+    return Card(
+      margin: const EdgeInsets.symmetric(vertical: 2, horizontal: 2),
+      color: estoque <= 0 ? Colors.grey.shade300 : Colors.white,
+      child: InkWell(
+        onTap: () => _selecionarProduto(produto),
+        borderRadius: BorderRadius.circular(8),
+        child: Padding(
+          padding: const EdgeInsets.all(8),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Badges
+                    if (temDescQtde || isPromo)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: 2),
+                        child: Wrap(
+                          spacing: 2,
+                          children: [
+                            if (isPromo)
+                              _buildMiniBadge('PROMO', Colors.green.shade600),
+                            if (temDescQtde)
+                              _buildMiniBadge('QTD', Colors.purple.shade600),
+                          ],
+                        ),
+                      ),
+                    Text(
+                      descricao,
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w500,
+                        color: estoque <= 0 ? Colors.grey : Colors.black87,
+                      ),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
+                ),
+              ),
+              const Icon(Icons.chevron_right, size: 18, color: Colors.grey),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildActiveCamera() {
+    // Tamanhos da area de leitura (+20%)
+    const double scanWidth = 264.0; // Era 220, +20%
+    const double scanHeight = 120.0; // Era 100, +20%
+    const double lineWidth = 240.0; // Era 200, +20%
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final centerX = constraints.maxWidth / 2;
+        final centerY = constraints.maxHeight / 2;
+
+        return Stack(
+          children: [
+            // Fundo escuro (cor solida da loja)
+            Positioned.fill(
+              child: Container(
+                color: const Color(0xFF0D47A1), // Azul escuro da marca
+              ),
+            ),
+
+            // Camera apenas na area de leitura (com ClipRRect)
+            Positioned(
+              left: centerX - scanWidth / 2,
+              top: centerY - scanHeight / 2,
+              width: scanWidth,
+              height: scanHeight,
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: MobileScanner(
                   controller: _scannerController,
                   onDetect: _onBarcodeDetect,
                 ),
-        ),
-
-        // Linha de mira central
-        Center(
-          child: Container(
-            width: isLandscape ? 150 : 200,
-            height: 3,
-            decoration: BoxDecoration(
-              color: Colors.red,
-              borderRadius: BorderRadius.circular(2),
-              boxShadow: [
-                BoxShadow(
-                  color: Colors.red.withValues(alpha: 0.5),
-                  blurRadius: 8,
-                  spreadRadius: 2,
-                ),
-              ],
-            ),
-          ),
-        ),
-
-        // Area de mira (retangulo)
-        Center(
-          child: Container(
-            width: isLandscape ? 180 : 220,
-            height: isLandscape ? 80 : 100,
-            decoration: BoxDecoration(
-              border: Border.all(color: Colors.green, width: 2),
-              borderRadius: BorderRadius.circular(12),
-            ),
-          ),
-        ),
-
-        // Timer no canto superior direito
-        Positioned(
-          top: 8,
-          right: 8,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: _secondsRemaining <= 5 ? Colors.red : Colors.black54,
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.timer, color: Colors.white, size: 14),
-                const SizedBox(width: 4),
-                Text(
-                  '${_secondsRemaining}s',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontSize: 12,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-
-        // Botao para desativar camera
-        Positioned(
-          top: 8,
-          left: 8,
-          child: InkWell(
-            onTap: _desativarCamera,
-            child: Container(
-              padding: const EdgeInsets.all(6),
-              decoration: BoxDecoration(
-                color: Colors.black54,
-                borderRadius: BorderRadius.circular(12),
               ),
-              child: const Icon(Icons.close, color: Colors.white, size: 18),
             ),
-          ),
-        ),
 
-        // Controle de Zoom na parte inferior
-        Positioned(
-          bottom: 8,
-          left: 8,
-          right: 8,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-            decoration: BoxDecoration(
-              color: Colors.black54,
-              borderRadius: BorderRadius.circular(12),
-            ),
-            child: Row(
-              children: [
-                const Icon(Icons.zoom_out, color: Colors.white, size: 16),
-                Expanded(
-                  child: SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      trackHeight: 3,
-                      thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 8),
+            // Linha de mira central (vermelha)
+            Center(
+              child: Container(
+                width: lineWidth,
+                height: 3,
+                decoration: BoxDecoration(
+                  color: Colors.red,
+                  borderRadius: BorderRadius.circular(2),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.red.withValues(alpha: 0.5),
+                      blurRadius: 8,
+                      spreadRadius: 2,
                     ),
-                    child: Slider(
-                      value: _zoomLevel,
-                      min: 0.0,
-                      max: 1.0,
-                      activeColor: Colors.green,
-                      inactiveColor: Colors.grey,
-                      onChanged: _setZoom,
-                    ),
-                  ),
+                  ],
                 ),
-                const Icon(Icons.zoom_in, color: Colors.white, size: 16),
-              ],
+              ),
             ),
-          ),
-        ),
+
+            // Borda da area de mira (retangulo verde)
+            Center(
+              child: Container(
+                width: scanWidth,
+                height: scanHeight,
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.green, width: 3),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+              ),
+            ),
+
+            // Texto instrucao acima da area de leitura
+            Positioned(
+              top: centerY - scanHeight / 2 - 40,
+              left: 0,
+              right: 0,
+              child: Text(
+                'Posicione o codigo de barras na area',
+                textAlign: TextAlign.center,
+                style: GoogleFonts.roboto(
+                  color: Colors.white70,
+                  fontSize: 12,
+                ),
+              ),
+            ),
+
+            // Controle de Zoom na parte inferior
+            Positioned(
+              bottom: 12,
+              left: 12,
+              right: 12,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1565C0),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.zoom_out, color: Colors.white70, size: 18),
+                    Expanded(
+                      child: SliderTheme(
+                        data: SliderTheme.of(context).copyWith(
+                          trackHeight: 4,
+                          thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 10),
+                          activeTrackColor: Colors.green,
+                          inactiveTrackColor: Colors.white24,
+                          thumbColor: Colors.green,
+                        ),
+                        child: Slider(
+                          value: _zoomLevel,
+                          min: 0.0,
+                          max: 1.0,
+                          onChanged: _setZoom,
+                        ),
+                      ),
+                    ),
+                    const Icon(Icons.zoom_in, color: Colors.white70, size: 18),
+                  ],
+                ),
+              ),
+            ),
 
         // Indicador de carregamento
         if (_carregandoProduto)
@@ -1110,7 +1391,9 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
               ),
             ),
           ),
-      ],
+          ],
+        );
+      },
     );
   }
 
@@ -1240,7 +1523,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 // Badges de promocao no topo
-            if (temDescontoQuantidade || temCombo || temLoteDesconto || isTabloide)
+            if (temDescontoQuantidade || temCombo || temLoteDesconto || isTabloide || _consultandoPec || (_resultadoPec != null && _resultadoPec!.temDesconto))
               Padding(
                 padding: const EdgeInsets.only(bottom: 12),
                 child: Wrap(
@@ -1274,6 +1557,44 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
                         icon: Icons.discount,
                         label: 'LOTE ${maiorDescontoLote.toStringAsFixed(0)}%',
                         colors: [Colors.teal.shade600, Colors.teal.shade400],
+                      ),
+                    // Badge PEC
+                    if (_resultadoPec != null && _resultadoPec!.temDesconto)
+                      _buildBadge(
+                        icon: Icons.card_membership,
+                        label: _resultadoPec!.isOfertaJornal ? 'JORNAL PEC' : 'PEC ${_resultadoPec!.descontoPercentual.toStringAsFixed(1)}%',
+                        colors: [Colors.purple.shade700, Colors.purple.shade500],
+                      ),
+                    // Indicador consultando PEC
+                    if (_consultandoPec)
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.purple.shade100,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            SizedBox(
+                              width: 12,
+                              height: 12,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                                color: Colors.purple.shade700,
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              'PEC...',
+                              style: TextStyle(
+                                fontSize: 10,
+                                color: Colors.purple.shade700,
+                                fontWeight: FontWeight.bold,
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
                   ],
                 ),
@@ -1421,6 +1742,12 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
             if (temLoteDesconto && lotesDesconto.isNotEmpty) ...[
               const SizedBox(height: 16),
               _buildLoteDescontoSection(lotesDesconto),
+            ],
+
+            // Desconto PEC
+            if (_resultadoPec != null && _resultadoPec!.temDesconto) ...[
+              const SizedBox(height: 16),
+              _buildPecSection(precoPraticado),
             ],
 
             const SizedBox(height: 12),
@@ -1598,7 +1925,20 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
 
     // Calcular totais para mostrar economia
     double totalComDescQtde = 0;
-    double totalSemDescQtde = precoPraticado * regras.length; // Total se comprar avulso (preco loja)
+
+    // Calcular o preco da 1a unidade (base de comparacao)
+    double precoUmaUnidade = precoPraticado;
+    if (regras.isNotEmpty) {
+      final descPrimeiraUnidade = (regras[0]['desconto'] as num?)?.toDouble() ?? 0;
+      final precoDescPrimeiraUnidade = precoCheio * (1 - descPrimeiraUnidade / 100);
+      // Usar o melhor preco entre desc quantidade da 1a unidade e preco loja
+      precoUmaUnidade = precoPraticado < precoDescPrimeiraUnidade
+          ? precoPraticado
+          : precoDescPrimeiraUnidade;
+    }
+
+    // Total se comprar avulso (preco de 1 unidade x quantidade total)
+    double totalSemDescQtde = precoUmaUnidade * regras.length;
 
     for (final regra in regras) {
       final descQtde = (regra['desconto'] as num?)?.toDouble() ?? 0;
@@ -2408,6 +2748,528 @@ class _PriceScannerScreenState extends State<PriceScannerScreen> {
               ),
             );
           }),
+        ],
+      ),
+    );
+  }
+
+  /// Secao de desconto PEC
+  Widget _buildPecSection(double precoAtual) {
+    if (_resultadoPec == null || !_resultadoPec!.temDesconto) {
+      return const SizedBox.shrink();
+    }
+
+    final precoPec = _resultadoPec!.precoFinalPec;
+    final desconto = _resultadoPec!.descontoPercentual;
+    final programa = _resultadoPec!.nomePrograma ?? 'PEC';
+    final isJornal = _resultadoPec!.isOfertaJornal;
+
+    // Verificar se o preco PEC eh melhor que o preco atual
+    final pecMelhor = precoPec < precoAtual;
+    final economia = precoAtual - precoPec;
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Colors.purple.shade50, Colors.purple.shade100],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.purple.shade300),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: Colors.purple.shade200,
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Icon(Icons.card_membership, color: Colors.purple.shade700, size: 18),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      isJornal ? 'OFERTA JORNAL PEC' : 'DESCONTO PEC',
+                      style: GoogleFonts.roboto(
+                        fontSize: 12,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.purple.shade700,
+                      ),
+                    ),
+                    if (programa.isNotEmpty)
+                      Text(
+                        programa,
+                        style: TextStyle(
+                          fontSize: 10,
+                          color: Colors.purple.shade600,
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+              if (!isJornal)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.purple.shade600,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    '-${desconto.toStringAsFixed(1)}%',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 12,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'PRECO COM CARTAO PEC',
+                        style: TextStyle(
+                          fontSize: 9,
+                          color: Colors.grey.shade600,
+                          fontWeight: FontWeight.w500,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        _currencyFormat.format(precoPec),
+                        style: GoogleFonts.roboto(
+                          fontSize: 24,
+                          fontWeight: FontWeight.bold,
+                          color: pecMelhor ? Colors.purple.shade700 : Colors.grey.shade600,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                if (pecMelhor && economia > 0)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: Colors.green.shade100,
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.green.shade300),
+                    ),
+                    child: Column(
+                      children: [
+                        Icon(Icons.savings, color: Colors.green.shade700, size: 16),
+                        const SizedBox(height: 2),
+                        Text(
+                          'ECONOMIZE',
+                          style: TextStyle(
+                            fontSize: 8,
+                            color: Colors.green.shade700,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Text(
+                          _currencyFormat.format(economia),
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: Colors.green.shade700,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                if (!pecMelhor)
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    decoration: BoxDecoration(
+                      color: Colors.orange.shade100,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      'Preco loja\nmelhor!',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 10,
+                        color: Colors.orange.shade700,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Carrossel de promocoes estilo ticker/marquee
+  Widget _buildCarrosselPromocoes() {
+    return Container(
+      color: const Color(0xFF1565C0),
+      child: Column(
+        children: [
+          // Header do carrossel
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            color: const Color(0xFF0D47A1),
+            child: Row(
+              children: [
+                Icon(Icons.local_offer, color: Colors.yellow.shade600, size: 18),
+                const SizedBox(width: 8),
+                Text(
+                  'PROMOCOES EM DESTAQUE',
+                  style: GoogleFonts.roboto(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1,
+                  ),
+                ),
+                const Spacer(),
+                Icon(Icons.arrow_forward, color: Colors.white54, size: 16),
+              ],
+            ),
+          ),
+          // Lista de produtos em scroll horizontal
+          Expanded(
+            child: ListView.builder(
+              controller: _carrosselScrollController,
+              scrollDirection: Axis.horizontal,
+              physics: const NeverScrollableScrollPhysics(),
+              itemCount: _produtosCarrossel.length * 2, // Duplicar para loop infinito
+              itemBuilder: (context, index) {
+                final produto = _produtosCarrossel[index % _produtosCarrossel.length];
+                return _buildCarrosselItem(produto);
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Item individual do carrossel de promocoes
+  Widget _buildCarrosselItem(Map<String, dynamic> produto) {
+    final descricao = produto['descricao'] ?? '';
+    final precoCheio = (produto['precoCheio'] as num?)?.toDouble() ?? 0;
+    final precoPraticado = (produto['precoPraticado'] as num?)?.toDouble() ?? 0;
+    final descontoPerc = precoCheio > 0
+        ? ((precoCheio - precoPraticado) / precoCheio * 100)
+        : 0.0;
+    final temDescontoPromocional = descontoPerc > 0;
+
+    // Info de promocao (data fim)
+    final diasRestantesPromocao = (produto['diasRestantesPromocao'] as num?)?.toInt();
+    final promocaoAcabando = diasRestantesPromocao != null && diasRestantesPromocao <= 7 && diasRestantesPromocao >= 0;
+    final ultimoDia = diasRestantesPromocao == 0;
+
+    // Info de desconto quantidade
+    final temDescontoQuantidade = produto['temDescontoQuantidade'] == true;
+    final tipoDescontoQtde = produto['tipoDescontoQtde'] as String?;
+    final textoDescontoQtde = produto['textoDescontoQtde'] as String?;
+    final descontoQtdePercentual = (produto['descontoQtdePercentual'] as num?)?.toDouble();
+    final precoUnitarioComDescQtde = (produto['precoUnitarioComDescQtde'] as num?)?.toDouble();
+    final qtdeMinimaDesconto = (produto['qtdeMinimaDesconto'] as num?)?.toInt();
+
+    // Card com destaque se tem algum desconto
+    final bool temAlgumDesconto = temDescontoPromocional || temDescontoQuantidade;
+
+    return Container(
+      width: 300,
+      margin: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: temDescontoQuantidade
+              ? (tipoDescontoQtde == 'caixa_gratis'
+                  ? [Colors.purple.shade50, Colors.purple.shade100]
+                  : [Colors.orange.shade50, Colors.orange.shade100])
+              : [Colors.white, Colors.grey.shade50],
+        ),
+        borderRadius: BorderRadius.circular(10),
+        border: temDescontoQuantidade
+            ? Border.all(
+                color: tipoDescontoQtde == 'caixa_gratis'
+                    ? Colors.purple.shade400
+                    : Colors.orange.shade400,
+                width: 2,
+              )
+            : null,
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.15),
+            blurRadius: 3,
+            offset: const Offset(0, 1),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header com badge de desconto quantidade destacado
+          if (temDescontoQuantidade)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: tipoDescontoQtde == 'caixa_gratis'
+                      ? [Colors.purple.shade600, Colors.purple.shade800]
+                      : [Colors.orange.shade600, Colors.orange.shade800],
+                ),
+                borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    tipoDescontoQtde == 'caixa_gratis'
+                        ? Icons.card_giftcard
+                        : Icons.local_offer,
+                    color: Colors.white,
+                    size: 16,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      textoDescontoQtde ?? '',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  if (descontoQtdePercentual != null && descontoQtdePercentual > 0)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withValues(alpha: 0.25),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Text(
+                        '-${descontoQtdePercentual.toStringAsFixed(0)}%',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+
+          // Nome do produto
+          Container(
+            width: double.infinity,
+            padding: EdgeInsets.fromLTRB(10, temDescontoQuantidade ? 4 : 8, 10, 4),
+            decoration: temDescontoQuantidade
+                ? null
+                : BoxDecoration(
+                    color: Colors.grey.shade100,
+                    borderRadius: const BorderRadius.vertical(top: Radius.circular(10)),
+                  ),
+            child: Text(
+              descricao,
+              style: GoogleFonts.roboto(
+                fontSize: 10,
+                fontWeight: FontWeight.w600,
+                color: Colors.grey.shade800,
+                height: 1.2,
+              ),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+
+          // Linha inferior com precos
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              child: Row(
+                children: [
+                  // Badge de desconto promocional (se houver)
+                  if (temDescontoPromocional && !temDescontoQuantidade)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: Colors.red.shade600,
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: Text(
+                        '-${descontoPerc.toStringAsFixed(0)}%',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  if (temDescontoPromocional && !temDescontoQuantidade)
+                    const SizedBox(width: 8),
+
+                  // Precos
+                  Expanded(
+                    child: temDescontoQuantidade
+                        ? Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              // Preco normal por unidade
+                              Row(
+                                children: [
+                                  Text(
+                                    _currencyFormat.format(precoPraticado),
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: Colors.grey.shade600,
+                                      decoration: TextDecoration.lineThrough,
+                                    ),
+                                  ),
+                                  Text(
+                                    ' /un',
+                                    style: TextStyle(
+                                      fontSize: 9,
+                                      color: Colors.grey.shade500,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                              // Preco unitario na promocao
+                              if (precoUnitarioComDescQtde != null && precoUnitarioComDescQtde > 0)
+                                Row(
+                                  crossAxisAlignment: CrossAxisAlignment.baseline,
+                                  textBaseline: TextBaseline.alphabetic,
+                                  children: [
+                                    Text(
+                                      _currencyFormat.format(precoUnitarioComDescQtde),
+                                      style: GoogleFonts.roboto(
+                                        fontSize: 15,
+                                        fontWeight: FontWeight.bold,
+                                        color: tipoDescontoQtde == 'caixa_gratis'
+                                            ? Colors.purple.shade700
+                                            : Colors.orange.shade700,
+                                      ),
+                                    ),
+                                    Text(
+                                      ' /un',
+                                      style: TextStyle(
+                                        fontSize: 9,
+                                        color: tipoDescontoQtde == 'caixa_gratis'
+                                            ? Colors.purple.shade600
+                                            : Colors.orange.shade600,
+                                      ),
+                                    ),
+                                    if (qtdeMinimaDesconto != null)
+                                      Text(
+                                        tipoDescontoQtde == 'caixa_gratis'
+                                            ? ' lev. $qtdeMinimaDesconto'
+                                            : ' a partir de $qtdeMinimaDesconto',
+                                        style: TextStyle(
+                                          fontSize: 8,
+                                          color: Colors.grey.shade600,
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                            ],
+                          )
+                        : Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              if (temDescontoPromocional)
+                                Text(
+                                  'De: ${_currencyFormat.format(precoCheio)}',
+                                  style: TextStyle(
+                                    fontSize: 9,
+                                    color: Colors.grey.shade500,
+                                    decoration: TextDecoration.lineThrough,
+                                  ),
+                                ),
+                              Row(
+                                children: [
+                                  if (temDescontoPromocional)
+                                    Text(
+                                      'Por: ',
+                                      style: TextStyle(
+                                        fontSize: 9,
+                                        color: Colors.green.shade700,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                  Text(
+                                    _currencyFormat.format(precoPraticado),
+                                    style: GoogleFonts.roboto(
+                                      fontSize: 14,
+                                      fontWeight: FontWeight.bold,
+                                      color: temAlgumDesconto
+                                          ? Colors.green.shade700
+                                          : Colors.grey.shade700,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ],
+                          ),
+                  ),
+
+                  // Badge de promocao acabando (quando aplicavel)
+                  if (promocaoAcabando && temDescontoPromocional && !temDescontoQuantidade)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: ultimoDia ? Colors.red.shade700 : Colors.amber.shade700,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            ultimoDia ? Icons.warning_amber : Icons.schedule,
+                            color: Colors.white,
+                            size: 10,
+                          ),
+                          const SizedBox(width: 2),
+                          Text(
+                            ultimoDia
+                                ? 'ULTIMO DIA!'
+                                : 'Acaba em ${diasRestantesPromocao}d',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 8,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
         ],
       ),
     );

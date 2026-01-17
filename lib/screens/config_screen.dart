@@ -32,6 +32,10 @@ class _ConfigScreenState extends State<ConfigScreen> {
   String? _tabelaDescontoNome;
   bool _carregandoTabelas = false;
 
+  // PEC (Programa de Economia Colaborativa)
+  final _pecCartaoController = TextEditingController();
+  bool _pecAtivo = false;
+
   @override
   void initState() {
     super.initState();
@@ -95,6 +99,13 @@ class _ConfigScreenState extends State<ConfigScreen> {
 
     final tabelaDesconto = await ConfigService.getTabelaDescontoId();
     _tabelaDescontoSelecionada = tabelaDesconto;
+
+    // Carregar config PEC
+    final pecCartao = await ConfigService.getCartaoPec();
+    if (pecCartao != null) {
+      _pecCartaoController.text = pecCartao;
+    }
+    _pecAtivo = await ConfigService.isPecAtivo();
 
     setState(() => _isLoading = false);
   }
@@ -414,6 +425,10 @@ class _ConfigScreenState extends State<ConfigScreen> {
     // Salvar tabela de desconto
     await ConfigService.saveTabelaDescontoId(_tabelaDescontoSelecionada ?? 1);
 
+    // Salvar config PEC
+    await ConfigService.saveCartaoPec(_pecCartaoController.text.trim());
+    await ConfigService.savePecAtivo(_pecAtivo);
+
     // Fechar conexao antiga
     await DatabaseService.closeConnection();
 
@@ -439,6 +454,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
     _databaseController.dispose();
     _usernameController.dispose();
     _passwordController.dispose();
+    _pecCartaoController.dispose();
     super.dispose();
   }
 
@@ -746,6 +762,80 @@ class _ConfigScreenState extends State<ConfigScreen> {
                               ),
                             ),
                           ),
+                        ],
+                      ),
+                    ),
+
+                    const SizedBox(height: 16),
+
+                    // Secao PEC (Programa de Economia Colaborativa)
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.grey.shade300,
+                            blurRadius: 4,
+                            offset: const Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.card_membership, color: Colors.purple.shade700),
+                              const SizedBox(width: 8),
+                              const Expanded(
+                                child: Text(
+                                  'PEC - Programa de Economia',
+                                  style: TextStyle(
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ),
+                              Switch(
+                                value: _pecAtivo,
+                                onChanged: (value) {
+                                  setState(() => _pecAtivo = value);
+                                },
+                                activeColor: Colors.purple.shade600,
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Consulta descontos do cartao fidelidade PEC ao bipar produtos.',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey.shade600,
+                            ),
+                          ),
+
+                          if (_pecAtivo) ...[
+                            const SizedBox(height: 16),
+
+                            // Cartao PEC (unico campo necessario)
+                            TextFormField(
+                              controller: _pecCartaoController,
+                              decoration: InputDecoration(
+                                labelText: 'Numero do Cartao PEC',
+                                hintText: 'Ex: 21156911307',
+                                prefixIcon: Icon(Icons.credit_card, color: Colors.purple.shade600),
+                                border: const OutlineInputBorder(),
+                                filled: true,
+                                fillColor: Colors.purple.shade50,
+                                helperText: 'Os demais parametros sao carregados automaticamente',
+                                helperStyle: TextStyle(fontSize: 11, color: Colors.grey.shade500),
+                              ),
+                              keyboardType: TextInputType.number,
+                              inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                            ),
+                          ],
                         ],
                       ),
                     ),

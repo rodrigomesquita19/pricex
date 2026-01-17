@@ -5,12 +5,10 @@ import 'screens/price_scanner_screen.dart';
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Permitir todas as orientacoes (retrato e paisagem)
+  // Forcar apenas modo retrato
   SystemChrome.setPreferredOrientations([
     DeviceOrientation.portraitUp,
     DeviceOrientation.portraitDown,
-    DeviceOrientation.landscapeLeft,
-    DeviceOrientation.landscapeRight,
   ]);
 
   // Configurar para tela cheia
