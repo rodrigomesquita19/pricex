@@ -34,6 +34,9 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
 
   // Zoom da camera
   double _zoomLevel = 0.0;
+  static const double _zoomPadrao = 0.8; // Zoom padrão de 80%
+  Timer? _zoomResetTimer;
+  static const Duration _zoomResetTimeout = Duration(seconds: 180); // 3 minutos
 
   // Timer para limpar produto da tela (60 segundos)
   Timer? _productDisplayTimer;
@@ -87,7 +90,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   bool _carrosselAtivo = false;
   bool _combosCarrosselAtivo = true; // Exibir combos no carrossel
   double _velocidadeCarrossel = 1.0; // Incremento de pixels por frame
-  static const Duration _carrosselRefreshInterval = Duration(seconds: 60);
+  static const Duration _carrosselRefreshInterval = Duration(minutes: 5);
 
   // PEC (Programa de Economia Colaborativa)
   PecService? _pecService;
@@ -231,11 +234,28 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   /// Aplica os produtos pendentes (chamado quando scroll esta no inicio)
   void _aplicarProdutosPendentes() {
     if (_produtosCarrosselPendentes != null && mounted) {
+      // Pausar animação temporariamente
+      _carrosselTimer?.cancel();
+
       setState(() {
         _produtosCarrossel = _produtosCarrosselPendentes!;
+        _produtosCarrosselPendentes = null;
       });
+
       debugPrint('[Carrossel] Produtos atualizados suavemente. Total: ${_produtosCarrossel.length}');
-      _produtosCarrosselPendentes = null;
+
+      // Garantir que o scroll está no início e reiniciar animação
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _carrosselScrollController != null && _carrosselScrollController!.hasClients) {
+          _carrosselScrollController!.jumpTo(0);
+        }
+        // Reiniciar animação após um pequeno delay
+        Future.delayed(const Duration(milliseconds: 50), () {
+          if (mounted) {
+            _iniciarAnimacaoCarrossel();
+          }
+        });
+      });
     }
   }
 
@@ -341,6 +361,9 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     }
   }
 
+  // Flag para controlar quando aplicar produtos pendentes
+  bool _aguardandoAplicarProdutos = false;
+
   /// Inicia a animacao do carrossel (scroll automatico)
   void _iniciarAnimacaoCarrossel() {
     _carrosselTimer?.cancel();
@@ -361,11 +384,19 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
         final currentScroll = _carrosselScrollController!.offset;
 
         if (currentScroll >= maxScroll) {
-          // Voltar ao inicio - momento seguro para atualizar produtos
+          // Voltar ao inicio primeiro (transição suave)
           _carrosselScrollController!.jumpTo(0);
-          // Aplicar produtos pendentes se houver
-          if (_produtosCarrosselPendentes != null) {
-            _aplicarProdutosPendentes();
+
+          // Se tem produtos pendentes, marcar para aplicar no próximo frame
+          if (_produtosCarrosselPendentes != null && !_aguardandoAplicarProdutos) {
+            _aguardandoAplicarProdutos = true;
+            // Aplicar após um pequeno delay para garantir transição suave
+            Future.delayed(const Duration(milliseconds: 100), () {
+              if (mounted && _produtosCarrosselPendentes != null) {
+                _aplicarProdutosPendentes();
+              }
+              _aguardandoAplicarProdutos = false;
+            });
           }
         } else {
           // Scroll suave com velocidade configurada
@@ -1144,7 +1175,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
 
     setState(() {
       _cameraAtiva = true;
-      _zoomLevel = 0.7; // Zoom inicial de 70%
+      _zoomLevel = _zoomPadrao; // Zoom inicial padrão
     });
 
     _scannerController = MobileScannerController(
@@ -1185,6 +1216,24 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
       _zoomLevel = value;
     });
     _scannerController?.setZoomScale(value);
+
+    // Se o zoom foi alterado do padrão, iniciar timer para resetar
+    if (value != _zoomPadrao) {
+      _iniciarTimerResetZoom();
+    } else {
+      _zoomResetTimer?.cancel();
+    }
+  }
+
+  /// Inicia o timer para resetar o zoom ao valor padrão após 180 segundos
+  void _iniciarTimerResetZoom() {
+    _zoomResetTimer?.cancel();
+    _zoomResetTimer = Timer(_zoomResetTimeout, () {
+      if (mounted && _cameraAtiva) {
+        debugPrint('[Zoom] Resetando zoom para o valor padrão ($_zoomPadrao)');
+        _setZoom(_zoomPadrao);
+      }
+    });
   }
 
   /// Inicia o timer de exibicao do produto (60 segundos)
@@ -1509,6 +1558,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     _productDisplayTimer?.cancel();
     _debounceTimer?.cancel();
     _pesquisaInactivityTimer?.cancel();
+    _zoomResetTimer?.cancel();
     _carrosselTimer?.cancel();
     _carrosselRefreshTimer?.cancel();
     _carrosselScrollController?.dispose();
@@ -2038,15 +2088,17 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   }
 
   Widget _buildActiveCamera() {
-    // Tamanhos da area de leitura (+20%)
-    const double scanWidth = 264.0; // Era 220, +20%
-    const double scanHeight = 120.0; // Era 100, +20%
-    const double lineWidth = 240.0; // Era 200, +20%
-
     return LayoutBuilder(
       builder: (context, constraints) {
-        final centerX = constraints.maxWidth / 2;
-        final centerY = constraints.maxHeight / 2;
+        final totalWidth = constraints.maxWidth;
+        final totalHeight = constraints.maxHeight;
+        final centerX = totalWidth / 2;
+        final centerY = totalHeight / 2;
+
+        // Área de leitura: 70% da largura (antes era ~60%), altura +10%
+        final double scanWidth = totalWidth * 0.85; // 85% da largura (15% mais de cada lado)
+        final double scanHeight = 152.0; // Altura aumentada
+        final double lineWidth = scanWidth * 0.9; // Linha proporcional
 
         return Stack(
           children: [
@@ -2060,7 +2112,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
             // Camera apenas na area de leitura (com ClipRRect)
             Positioned(
               left: centerX - scanWidth / 2,
-              top: centerY - scanHeight / 2,
+              top: centerY - scanHeight / 2 - 17, // Subiu 17px para não sobrepor o zoom
               width: scanWidth,
               height: scanHeight,
               child: ClipRRect(
@@ -2073,7 +2125,9 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
             ),
 
             // Linha de mira central (vermelha)
-            Center(
+            Positioned(
+              left: centerX - lineWidth / 2,
+              top: centerY - 17, // Alinhado com a câmera
               child: Container(
                 width: lineWidth,
                 height: 3,
@@ -2092,7 +2146,9 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
             ),
 
             // Borda da area de mira (retangulo verde)
-            Center(
+            Positioned(
+              left: centerX - scanWidth / 2,
+              top: centerY - scanHeight / 2 - 17, // Alinhado com a câmera
               child: Container(
                 width: scanWidth,
                 height: scanHeight,
@@ -2103,9 +2159,9 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
               ),
             ),
 
-            // Texto instrucao acima da area de leitura
+            // Texto instrucao no TOPO do card
             Positioned(
-              top: centerY - scanHeight / 2 - 40,
+              top: 8,
               left: 0,
               right: 0,
               child: Text(
@@ -2113,7 +2169,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                 textAlign: TextAlign.center,
                 style: GoogleFonts.roboto(
                   color: Colors.white70,
-                  fontSize: 12,
+                  fontSize: 20,
                 ),
               ),
             ),
@@ -2282,7 +2338,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
             'Nenhum produto',
             style: GoogleFonts.roboto(
               color: Colors.white.withValues(alpha: 0.5),
-              fontSize: 16,
+              fontSize: 32,
             ),
           ),
           const SizedBox(height: 8),
@@ -2290,7 +2346,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
             'Use a camera ou pesquise',
             style: GoogleFonts.roboto(
               color: Colors.white.withValues(alpha: 0.3),
-              fontSize: 12,
+              fontSize: 24,
             ),
           ),
         ],
