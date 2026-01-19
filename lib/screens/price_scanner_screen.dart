@@ -94,6 +94,12 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   bool _consultandoPec = false;
   String _nomeOperadoraPec = 'PEC'; // Nome da operadora para exibicao
 
+  /// Verifica se o PEC oferece um preco melhor que o preco praticado atual
+  bool _pecEhVantajoso(double precoAtual) {
+    if (_resultadoPec == null || !_resultadoPec!.temDesconto) return false;
+    return _resultadoPec!.precoFinalPec < precoAtual;
+  }
+
   // Logo da loja
   String? _logoLojaPath;
 
@@ -2092,7 +2098,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
               mainAxisSize: MainAxisSize.min,
               children: [
                 // Badges de promocao no topo
-            if (temDescontoQuantidade || temCombo || temLoteDesconto || isTabloide || isDescontoAvista || _consultandoPec || (_resultadoPec != null && _resultadoPec!.temDesconto))
+            if (temDescontoQuantidade || temCombo || temLoteDesconto || isTabloide || isDescontoAvista || _consultandoPec || _pecEhVantajoso(precoPraticado))
               Padding(
                 padding: const EdgeInsets.only(bottom: 12),
                 child: Wrap(
@@ -2134,8 +2140,8 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                         label: 'LOTE ${maiorDescontoLote.toStringAsFixed(0)}%',
                         colors: [Colors.teal.shade600, Colors.teal.shade400],
                       ),
-                    // Badge PEC/Operadora
-                    if (_resultadoPec != null && _resultadoPec!.temDesconto)
+                    // Badge PEC/Operadora (so mostra se for vantajoso)
+                    if (_pecEhVantajoso(precoPraticado))
                       _buildBadge(
                         icon: Icons.card_membership,
                         label: _resultadoPec!.isOfertaJornal ? 'JORNAL $_nomeOperadoraPec' : '$_nomeOperadoraPec ${_resultadoPec!.descontoPercentual.toStringAsFixed(1)}%',
@@ -2320,8 +2326,8 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
               _buildLoteDescontoSection(lotesDesconto),
             ],
 
-            // Desconto PEC
-            if (_resultadoPec != null && _resultadoPec!.temDesconto) ...[
+            // Desconto PEC (so mostra se for vantajoso)
+            if (_pecEhVantajoso(precoPraticado)) ...[
               const SizedBox(height: 16),
               _buildPecSection(precoPraticado),
             ],
@@ -3329,7 +3335,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     );
   }
 
-  /// Secao de desconto PEC
+  /// Secao de desconto PEC (so eh chamada quando PEC eh vantajoso)
   Widget _buildPecSection(double precoAtual) {
     if (_resultadoPec == null || !_resultadoPec!.temDesconto) {
       return const SizedBox.shrink();
@@ -3340,8 +3346,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     final programa = _resultadoPec!.nomePrograma ?? _nomeOperadoraPec;
     final isJornal = _resultadoPec!.isOfertaJornal;
 
-    // Verificar se o preco PEC eh melhor que o preco atual
-    final pecMelhor = precoPec < precoAtual;
+    // Calcular economia (ja sabemos que PEC eh vantajoso)
     final economia = precoAtual - precoPec;
 
     return Container(
@@ -3437,13 +3442,13 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                         style: GoogleFonts.roboto(
                           fontSize: 24,
                           fontWeight: FontWeight.bold,
-                          color: pecMelhor ? Colors.purple.shade700 : Colors.grey.shade600,
+                          color: Colors.purple.shade700,
                         ),
                       ),
                     ],
                   ),
                 ),
-                if (pecMelhor && economia > 0)
+                if (economia > 0)
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
                     decoration: BoxDecoration(
@@ -3472,23 +3477,6 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                           ),
                         ),
                       ],
-                    ),
-                  ),
-                if (!pecMelhor)
-                  Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    decoration: BoxDecoration(
-                      color: Colors.orange.shade100,
-                      borderRadius: BorderRadius.circular(8),
-                    ),
-                    child: Text(
-                      'Preco loja\nmelhor!',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontSize: 10,
-                        color: Colors.orange.shade700,
-                        fontWeight: FontWeight.w500,
-                      ),
                     ),
                   ),
               ],
