@@ -1,3 +1,4 @@
+import 'package:bcrypt/bcrypt.dart';
 import 'package:flutter/foundation.dart';
 import 'package:mysql1/mysql1.dart';
 import '../models/database_config.dart';
@@ -2205,5 +2206,70 @@ class DatabaseService {
   /// Helper para obter conexao (uso interno)
   static Future<MySqlConnection?> _getConnection() async {
     return await getConnection();
+  }
+
+  /// Autentica usuario e verifica permissao de configuracao do sistema
+  /// Retorna Map com 'success', 'message', 'userId', 'userName'
+  /// Permissao verificada: posicao 116 do campo supervisor = 'S'
+  static Future<Map<String, dynamic>> loginUsuario(String usuarioId, String senha) async {
+    try {
+      final conn = await getConnection();
+      if (conn == null) {
+        return {'success': false, 'message': 'Sem conexão com o banco de dados'};
+      }
+
+      // Busca o usuario pelo codigo
+      final results = await conn.query('''
+        SELECT usuario_id, nome, senha, supervisor
+        FROM usuario
+        WHERE usuario_id = ?
+      ''', [usuarioId]);
+
+      if (results.isEmpty) {
+        return {'success': false, 'message': 'Usuário não encontrado'};
+      }
+
+      final row = results.first;
+      final dbPassword = row['senha']?.toString() ?? '';
+      final dbUserId = row['usuario_id']?.toString() ?? '';
+      final dbUserName = row['nome']?.toString() ?? '';
+      final supervisor = row['supervisor']?.toString() ?? '';
+
+      // Verifica a senha com BCrypt
+      bool senhaCorreta = false;
+      try {
+        senhaCorreta = BCrypt.checkpw(senha, dbPassword);
+      } catch (e) {
+        // Fallback: comparacao direta (compatibilidade com senhas antigas)
+        senhaCorreta = (dbPassword == senha);
+      }
+
+      if (!senhaCorreta) {
+        return {'success': false, 'message': 'Senha incorreta'};
+      }
+
+      // Verifica permissao na posicao 116 (Permitir Configurar Sistema)
+      const int posicaoPermissao = 116;
+      final int indice = posicaoPermissao - 1;
+
+      if (supervisor.length < posicaoPermissao || supervisor[indice] != 'S') {
+        return {
+          'success': false,
+          'message': 'Usuário sem permissão para esta função.\n\n'
+              'Libere no ERP, no cadastro do usuário, '
+              'aba "Permissões Supervisor", a permissão "Permitir Configurar Sistema".',
+        };
+      }
+
+      debugPrint('[DatabaseService] Login bem-sucedido: $dbUserName (ID: $dbUserId)');
+      return {
+        'success': true,
+        'userId': dbUserId,
+        'userName': dbUserName,
+      };
+    } catch (e) {
+      debugPrint('[DatabaseService] Erro ao autenticar: $e');
+      return {'success': false, 'message': 'Erro ao autenticar: $e'};
+    }
   }
 }

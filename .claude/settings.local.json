@@ -4,7 +4,12 @@
       "Bash(flutter pub get:*)",
       "Bash(flutter analyze:*)",
       "Bash(git add:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(dir /b /s \"F:\\\\ProjetosFlutter\")",
+      "Bash(findstr:*)",
+      "WebSearch",
+      "WebFetch(domain:pub.dev)"
     ]
   }
 }

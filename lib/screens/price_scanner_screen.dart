@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
@@ -13,6 +14,7 @@ import '../services/beep_service.dart';
 import '../services/config_service.dart';
 import '../services/database_service.dart';
 import '../services/pec_service.dart';
+import '../main.dart' show pararModoKiosk;
 import 'config_screen.dart';
 
 class PriceScannerScreen extends StatefulWidget {
@@ -524,17 +526,344 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     }
   }
 
-  void _abrirConfiguracoes() async {
+  void _abrirConfiguracoes() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (context) => Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF455A64),
+          borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        child: SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Indicador de arraste
+              Container(
+                margin: const EdgeInsets.only(top: 12),
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white38,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(height: 20),
+              // Titulo
+              Text(
+                'Configurações',
+                style: GoogleFonts.roboto(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 20),
+              // Opcao 1: Banco de Dados (sem autenticacao)
+              _buildMenuOption(
+                icon: Icons.storage,
+                label: 'Configuração do Banco de Dados',
+                color: Colors.blue,
+                onTap: () {
+                  Navigator.pop(context);
+                  _abrirConfiguracaoBanco();
+                },
+              ),
+              // Opcao 2: Descontos (com autenticacao)
+              _buildMenuOption(
+                icon: Icons.discount,
+                label: 'Configuração dos Descontos',
+                color: Colors.orange,
+                requiresAuth: true,
+                onTap: () {
+                  Navigator.pop(context);
+                  _abrirConfiguracaoDescontosComAuth();
+                },
+              ),
+              // Opcao 3: Sair (com autenticacao)
+              _buildMenuOption(
+                icon: Icons.exit_to_app,
+                label: 'Sair do Aplicativo',
+                color: Colors.red,
+                requiresAuth: true,
+                onTap: () {
+                  Navigator.pop(context);
+                  _sairDoAplicativoComAuth();
+                },
+              ),
+              const SizedBox(height: 20),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Constroi opcao do menu de configuracoes
+  Widget _buildMenuOption({
+    required IconData icon,
+    required String label,
+    required Color color,
+    required VoidCallback onTap,
+    bool requiresAuth = false,
+  }) {
+    return ListTile(
+      leading: Container(
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: 0.2),
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Icon(icon, color: color, size: 24),
+      ),
+      title: Text(
+        label,
+        style: GoogleFonts.roboto(
+          color: Colors.white,
+          fontSize: 16,
+        ),
+      ),
+      trailing: requiresAuth
+          ? Icon(Icons.lock, color: Colors.white38, size: 18)
+          : null,
+      onTap: onTap,
+    );
+  }
+
+  /// Abre configuracao do banco de dados (sem autenticacao)
+  void _abrirConfiguracaoBanco() async {
     final result = await Navigator.push(
       context,
-      MaterialPageRoute(builder: (_) => const ConfigScreen()),
+      MaterialPageRoute(builder: (_) => const ConfigScreen(apenasConexao: true)),
     );
 
     if (result == true) {
       _tabelaDescontoId = await ConfigService.getTabelaDescontoId();
     }
+    await _recarregarConfiguracoesAposVoltar();
+  }
 
-    // Sempre recarregar configuracoes do carrossel e logo ao voltar
+  /// Abre configuracao de descontos com autenticacao
+  void _abrirConfiguracaoDescontosComAuth() async {
+    final autenticado = await _mostrarDialogoLogin();
+    if (autenticado) {
+      final result = await Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => const ConfigScreen()),
+      );
+
+      if (result == true) {
+        _tabelaDescontoId = await ConfigService.getTabelaDescontoId();
+      }
+      await _recarregarConfiguracoesAposVoltar();
+    }
+  }
+
+  /// Sai do aplicativo com autenticacao
+  void _sairDoAplicativoComAuth() async {
+    final autenticado = await _mostrarDialogoLogin();
+    if (autenticado) {
+      // Confirmar saida
+      final confirmar = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          backgroundColor: const Color(0xFF455A64),
+          title: Text(
+            'Sair do Aplicativo',
+            style: GoogleFonts.roboto(color: Colors.white),
+          ),
+          content: Text(
+            'Deseja realmente sair do aplicativo?',
+            style: GoogleFonts.roboto(color: Colors.white70),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancelar'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, true),
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
+              child: const Text('Sair', style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      );
+
+      if (confirmar == true) {
+        // Fechar o aplicativo completamente
+        _desativarCamera();
+        _carrosselTimer?.cancel();
+        _carrosselRefreshTimer?.cancel();
+        // Parar modo kiosk antes de fechar
+        await pararModoKiosk();
+        SystemNavigator.pop();
+      }
+    }
+  }
+
+  /// Mostra dialogo de login e retorna true se autenticado com sucesso
+  Future<bool> _mostrarDialogoLogin() async {
+    final usuarioController = TextEditingController();
+    final senhaController = TextEditingController();
+    bool senhaVisivel = false;
+    bool carregando = false;
+    String? mensagemErro;
+
+    final resultado = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          backgroundColor: const Color(0xFF455A64),
+          title: Row(
+            children: [
+              Icon(Icons.lock, color: Colors.orange),
+              const SizedBox(width: 8),
+              Text(
+                'Autenticação',
+                style: GoogleFonts.roboto(color: Colors.white),
+              ),
+            ],
+          ),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'Esta função requer permissão de supervisor.',
+                  style: GoogleFonts.roboto(color: Colors.white70, fontSize: 14),
+                ),
+                const SizedBox(height: 16),
+                // Campo Usuario
+                TextField(
+                  controller: usuarioController,
+                  keyboardType: TextInputType.number,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    labelText: 'Código do Usuário',
+                    labelStyle: const TextStyle(color: Colors.white70),
+                    prefixIcon: const Icon(Icons.person, color: Colors.white54),
+                    enabledBorder: OutlineInputBorder(
+                      borderSide: const BorderSide(color: Colors.white38),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderSide: const BorderSide(color: Colors.orange),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                // Campo Senha
+                TextField(
+                  controller: senhaController,
+                  obscureText: !senhaVisivel,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    labelText: 'Senha',
+                    labelStyle: const TextStyle(color: Colors.white70),
+                    prefixIcon: const Icon(Icons.lock, color: Colors.white54),
+                    suffixIcon: IconButton(
+                      icon: Icon(
+                        senhaVisivel ? Icons.visibility_off : Icons.visibility,
+                        color: Colors.white54,
+                      ),
+                      onPressed: () => setState(() => senhaVisivel = !senhaVisivel),
+                    ),
+                    enabledBorder: OutlineInputBorder(
+                      borderSide: const BorderSide(color: Colors.white38),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    focusedBorder: OutlineInputBorder(
+                      borderSide: const BorderSide(color: Colors.orange),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                ),
+                // Mensagem de erro
+                if (mensagemErro != null) ...[
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Colors.red.withValues(alpha: 0.2),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.error_outline, color: Colors.red, size: 18),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            mensagemErro!,
+                            style: const TextStyle(color: Colors.red, fontSize: 12),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: carregando ? null : () => Navigator.pop(context, false),
+              child: const Text('Cancelar'),
+            ),
+            ElevatedButton(
+              onPressed: carregando
+                  ? null
+                  : () async {
+                      final usuario = usuarioController.text.trim();
+                      final senha = senhaController.text;
+
+                      if (usuario.isEmpty || senha.isEmpty) {
+                        setState(() => mensagemErro = 'Preencha todos os campos');
+                        return;
+                      }
+
+                      setState(() {
+                        carregando = true;
+                        mensagemErro = null;
+                      });
+
+                      final result = await DatabaseService.loginUsuario(usuario, senha);
+
+                      if (result['success'] == true) {
+                        Navigator.pop(context, true);
+                      } else {
+                        setState(() {
+                          carregando = false;
+                          mensagemErro = result['message'] ?? 'Erro ao autenticar';
+                        });
+                      }
+                    },
+              style: ElevatedButton.styleFrom(backgroundColor: Colors.orange),
+              child: carregando
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2,
+                        valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                      ),
+                    )
+                  : const Text('Entrar', style: TextStyle(color: Colors.white)),
+            ),
+          ],
+        ),
+      ),
+    );
+
+    return resultado == true;
+  }
+
+  /// Recarrega configuracoes apos voltar da tela de config
+  Future<void> _recarregarConfiguracoesAposVoltar() async {
+    // Recarregar velocidade do carrossel
     final nivelVelocidade = await ConfigService.getVelocidadeCarrossel();
     final novaVelocidade = ConfigService.getIncrementoVelocidade(nivelVelocidade);
     if (novaVelocidade != _velocidadeCarrossel) {
@@ -1604,36 +1933,38 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   }
 
   Widget _buildProductArea() {
+    Widget content;
+
     if (_carregandoProduto) {
-      return const Center(
+      content = const Center(
         child: CircularProgressIndicator(color: Colors.white),
       );
+    } else if (_mensagemErro != null) {
+      content = _buildErrorMessage();
+    } else if (_produtoAtual == null) {
+      content = _buildEmptyState();
+    } else {
+      content = _buildProductCard();
     }
 
-    if (_mensagemErro != null) {
-      return _buildErrorMessage();
-    }
-
-    if (_produtoAtual == null) {
-      return _buildEmptyState();
-    }
-
-    return _buildProductCard();
-  }
-
-  Widget _buildEmptyState() {
-    return Stack(
-      children: [
-        // Logo semi-transparente no fundo
-        if (_logoLojaPath != null)
+    // Adicionar logo como fundo em todo o quadrante (estatico, sem animacao)
+    if (_logoLojaPath != null) {
+      return Stack(
+        children: [
+          // Logo semi-transparente preenchendo todo o quadrante
           Positioned.fill(
-            child: Center(
-              child: Opacity(
-                opacity: 0.15,
+            child: Opacity(
+              opacity: 0.12,
+              child: ColorFiltered(
+                // Converter para tons de cinza e escurecer brancos
+                colorFilter: const ColorFilter.matrix(<double>[
+                  0.15, 0.15, 0.15, 0, 30,
+                  0.15, 0.15, 0.15, 0, 30,
+                  0.15, 0.15, 0.15, 0, 30,
+                  0,    0,    0,    1, 0,
+                ]),
                 child: Image.file(
                   File(_logoLojaPath!),
-                  width: 280,
-                  height: 280,
                   fit: BoxFit.contain,
                   errorBuilder: (context, error, stackTrace) {
                     return const SizedBox.shrink();
@@ -1642,36 +1973,43 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
               ),
             ),
           ),
-        // Conteudo principal
-        Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              Icon(
-                Icons.shopping_cart_outlined,
-                size: 64,
-                color: Colors.white.withValues(alpha: 0.3),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                'Nenhum produto',
-                style: GoogleFonts.roboto(
-                  color: Colors.white.withValues(alpha: 0.5),
-                  fontSize: 16,
-                ),
-              ),
-              const SizedBox(height: 8),
-              Text(
-                'Use a camera ou pesquise',
-                style: GoogleFonts.roboto(
-                  color: Colors.white.withValues(alpha: 0.3),
-                  fontSize: 12,
-                ),
-              ),
-            ],
+          // Conteudo principal
+          content,
+        ],
+      );
+    }
+
+    return content;
+  }
+
+  Widget _buildEmptyState() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(
+            Icons.shopping_cart_outlined,
+            size: 64,
+            color: Colors.white.withValues(alpha: 0.3),
           ),
-        ),
-      ],
+          const SizedBox(height: 12),
+          Text(
+            'Nenhum produto',
+            style: GoogleFonts.roboto(
+              color: Colors.white.withValues(alpha: 0.5),
+              fontSize: 16,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Use a camera ou pesquise',
+            style: GoogleFonts.roboto(
+              color: Colors.white.withValues(alpha: 0.3),
+              fontSize: 12,
+            ),
+          ),
+        ],
+      ),
     );
   }
 

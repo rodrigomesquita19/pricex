@@ -9,7 +9,9 @@ import '../services/database_service.dart';
 import 'grupos_exibicao_screen.dart';
 
 class ConfigScreen extends StatefulWidget {
-  const ConfigScreen({super.key});
+  final bool apenasConexao;
+
+  const ConfigScreen({super.key, this.apenasConexao = false});
 
   @override
   State<ConfigScreen> createState() => _ConfigScreenState();
@@ -532,9 +534,9 @@ class _ConfigScreenState extends State<ConfigScreen> {
           icon: const Icon(Icons.arrow_back, color: Colors.white),
           onPressed: () => Navigator.pop(context),
         ),
-        title: const Text(
-          'Configuracoes',
-          style: TextStyle(
+        title: Text(
+          widget.apenasConexao ? 'Configuração do Banco' : 'Configurações',
+          style: const TextStyle(
             color: Colors.white,
             fontWeight: FontWeight.bold,
           ),
@@ -723,10 +725,12 @@ class _ConfigScreenState extends State<ConfigScreen> {
                       ),
                     ),
 
-                    const SizedBox(height: 16),
+                    // Secoes adicionais (apenas quando nao for apenasConexao)
+                    if (!widget.apenasConexao) ...[
+                      const SizedBox(height: 16),
 
-                    // Secao Tabela de Desconto
-                    Container(
+                      // Secao Tabela de Desconto
+                      Container(
                       padding: const EdgeInsets.all(16),
                       decoration: BoxDecoration(
                         color: Colors.white,
@@ -1150,6 +1154,7 @@ class _ConfigScreenState extends State<ConfigScreen> {
                         ],
                       ),
                     ),
+                    ], // Fim do if (!widget.apenasConexao)
 
                     const SizedBox(height: 24),
 
