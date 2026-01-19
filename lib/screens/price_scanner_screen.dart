@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:intl/intl.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 import '../models/grupo_exibicao.dart';
@@ -14,7 +15,7 @@ import '../services/beep_service.dart';
 import '../services/config_service.dart';
 import '../services/database_service.dart';
 import '../services/pec_service.dart';
-import '../main.dart' show pararModoKiosk;
+import '../main.dart' show pararModoKiosk, KioskController, KioskEscapeZone;
 import 'config_screen.dart';
 
 class PriceScannerScreen extends StatefulWidget {
@@ -70,6 +71,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   final stt.SpeechToText _speech = stt.SpeechToText();
   bool _speechDisponivel = false;
   bool _ouvindo = false;
+  String? _speechErro; // Mensagem de erro se speech não disponível
 
   // Tabela de desconto
   int _tabelaDescontoId = 1;
@@ -449,38 +451,69 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
 
   /// Inicializa o reconhecimento de voz
   Future<void> _inicializarReconhecimentoVoz() async {
-    _speechDisponivel = await _speech.initialize(
-      onStatus: (status) {
-        debugPrint('[Speech] Status: $status');
-        if (status == 'done' || status == 'notListening') {
+    debugPrint('[Speech] Iniciando inicialização do reconhecimento de voz...');
+
+    // Solicitar permissão do microfone explicitamente
+    final micPermission = await Permission.microphone.request();
+    debugPrint('[Speech] Permissão do microfone: $micPermission');
+
+    if (!micPermission.isGranted) {
+      debugPrint('[Speech] Permissão do microfone negada');
+      if (mounted) {
+        setState(() {
+          _speechDisponivel = false;
+          _speechErro = 'Permissão do microfone negada';
+        });
+      }
+      return;
+    }
+
+    // Tentar inicializar o speech
+    try {
+      _speechDisponivel = await _speech.initialize(
+        onStatus: (status) {
+          debugPrint('[Speech] Status: $status');
+          if (status == 'done' || status == 'notListening') {
+            if (mounted) {
+              setState(() => _ouvindo = false);
+              // Reiniciar automaticamente se ainda estiver no modo de busca por nome
+              if (!_modoBuscaCamera && _speechDisponivel) {
+                Future.delayed(const Duration(milliseconds: 500), () {
+                  if (mounted && !_modoBuscaCamera && !_ouvindo) {
+                    _iniciarReconhecimentoVozContinuo();
+                  }
+                });
+              }
+            }
+          }
+        },
+        onError: (error) {
           if (mounted) {
             setState(() => _ouvindo = false);
-            // Reiniciar automaticamente se ainda estiver no modo de busca por nome
+            // Tentar reiniciar apos erro se ainda estiver no modo de busca
             if (!_modoBuscaCamera && _speechDisponivel) {
-              Future.delayed(const Duration(milliseconds: 500), () {
+              Future.delayed(const Duration(seconds: 1), () {
                 if (mounted && !_modoBuscaCamera && !_ouvindo) {
                   _iniciarReconhecimentoVozContinuo();
                 }
               });
             }
           }
-        }
-      },
-      onError: (error) {
-        if (mounted) {
-          setState(() => _ouvindo = false);
-          // Tentar reiniciar apos erro se ainda estiver no modo de busca
-          if (!_modoBuscaCamera && _speechDisponivel) {
-            Future.delayed(const Duration(seconds: 1), () {
-              if (mounted && !_modoBuscaCamera && !_ouvindo) {
-                _iniciarReconhecimentoVozContinuo();
-              }
-            });
-          }
-        }
-        debugPrint('[Speech] Erro: $error');
-      },
-    );
+          debugPrint('[Speech] Erro: $error');
+        },
+      );
+
+      debugPrint('[Speech] Inicialização concluída. Disponível: $_speechDisponivel');
+
+      if (!_speechDisponivel) {
+        _speechErro = 'Serviço de voz não disponível neste dispositivo';
+      }
+    } catch (e) {
+      debugPrint('[Speech] Exceção na inicialização: $e');
+      _speechDisponivel = false;
+      _speechErro = 'Erro ao inicializar: $e';
+    }
+
     if (mounted) {
       setState(() {});
     }
@@ -529,6 +562,217 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
       await _pararReconhecimentoVoz();
     } else {
       await _iniciarReconhecimentoVozContinuo();
+    }
+  }
+
+  /// Mostra erro do microfone e oferece tentar novamente
+  void _mostrarErroMicrofone() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF37474F),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.orange.shade700,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.mic_off, color: Colors.white, size: 24),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              'Microfone',
+              style: GoogleFonts.roboto(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              _speechErro ?? 'Reconhecimento de voz não disponível',
+              style: GoogleFonts.roboto(color: Colors.white70),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.blue.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.blue.shade300),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Possíveis soluções:',
+                    style: GoogleFonts.roboto(
+                      color: Colors.blue.shade200,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    '• Verifique se a permissão de microfone está ativa nas configurações do Android\n'
+                    '• Verifique se o Google está instalado e atualizado\n'
+                    '• Reinicie o aplicativo',
+                    style: GoogleFonts.roboto(
+                      color: Colors.blue.shade200,
+                      fontSize: 11,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Fechar'),
+          ),
+          ElevatedButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              // Tentar inicializar novamente
+              await _inicializarReconhecimentoVoz();
+              if (_speechDisponivel && mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Microfone ativado com sucesso!'),
+                    backgroundColor: Colors.green,
+                  ),
+                );
+              }
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.blue.shade600,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Tentar Novamente'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Chamado quando o usuário ativa o mecanismo de escape (5 toques rápidos no canto)
+  void _onKioskEscape() async {
+    // Pausar modo imersivo para mostrar barras do sistema
+    KioskController.pausarModoImersivo();
+
+    // Mostrar barras do sistema
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.manual,
+      overlays: SystemUiOverlay.values,
+    );
+
+    // Mostrar diálogo de confirmação
+    final confirmar = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF37474F),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.orange.shade700,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.lock_open, color: Colors.white, size: 24),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              'Modo Kiosk',
+              style: GoogleFonts.roboto(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'O modo kiosk foi temporariamente pausado.',
+              style: GoogleFonts.roboto(color: Colors.white70),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Você pode acessar o sistema Android normalmente agora.',
+              style: GoogleFonts.roboto(color: Colors.white70, fontSize: 13),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.blue.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.blue.shade300),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.info_outline, color: Colors.blue, size: 20),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Para reativar, toque em "Reativar Kiosk" ou reinicie o app.',
+                      style: GoogleFonts.roboto(
+                        color: Colors.blue.shade200,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              // Parar kiosk completamente e sair
+              await pararModoKiosk();
+              if (context.mounted) {
+                Navigator.pop(context, false);
+                SystemNavigator.pop();
+              }
+            },
+            child: Text(
+              'Sair do App',
+              style: TextStyle(color: Colors.red.shade300),
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.green.shade600,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Reativar Kiosk'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmar == true) {
+      // Reativar modo kiosk
+      KioskController.resumirModoImersivo();
+      KioskController.aplicarModoImersivo();
+      await KioskController.iniciar();
     }
   }
 
@@ -1281,32 +1525,37 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     final isLandscape =
         MediaQuery.of(context).orientation == Orientation.landscape;
 
-    return Scaffold(
-      backgroundColor: const Color(0xFF546E7A),
-      appBar: AppBar(
-        backgroundColor: const Color(0xFF78909C),
-        title: Row(
-          children: [
-            const Icon(Icons.qr_code_scanner, color: Colors.white),
-            const SizedBox(width: 12),
-            Text(
-              'PriceX',
-              style: GoogleFonts.roboto(
-                color: Colors.white,
-                fontWeight: FontWeight.bold,
-                fontSize: 24,
+    return KioskEscapeZone(
+      toquesNecessarios: 5,
+      tempoLimite: const Duration(seconds: 3),
+      onEscape: _onKioskEscape,
+      child: Scaffold(
+        backgroundColor: const Color(0xFF546E7A),
+        appBar: AppBar(
+          backgroundColor: const Color(0xFF78909C),
+          title: Row(
+            children: [
+              const Icon(Icons.qr_code_scanner, color: Colors.white),
+              const SizedBox(width: 12),
+              Text(
+                'PriceX',
+                style: GoogleFonts.roboto(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                  fontSize: 24,
+                ),
               ),
+            ],
+          ),
+          actions: [
+            IconButton(
+              icon: const Icon(Icons.settings, color: Colors.white),
+              onPressed: _abrirConfiguracoes,
             ),
           ],
         ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.settings, color: Colors.white),
-            onPressed: _abrirConfiguracoes,
-          ),
-        ],
+        body: isLandscape ? _buildLandscapeLayout() : _buildPortraitLayout(),
       ),
-      body: isLandscape ? _buildLandscapeLayout() : _buildPortraitLayout(),
     );
   }
 
@@ -1594,29 +1843,33 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                     onSubmitted: (_) => _executarPesquisa(),
                   ),
                 ),
-                // Botao de microfone
-                if (_speechDisponivel) ...[
-                  const SizedBox(width: 6),
-                  GestureDetector(
-                    onTap: _toggleReconhecimentoVoz,
-                    child: Container(
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: _ouvindo ? Colors.red : Colors.green.shade600,
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      child: Icon(
-                        _ouvindo ? Icons.mic : Icons.mic_none,
-                        color: Colors.white,
-                        size: 22,
-                      ),
+                // Botao de microfone (sempre visivel)
+                const SizedBox(width: 6),
+                GestureDetector(
+                  onTap: _speechDisponivel
+                      ? _toggleReconhecimentoVoz
+                      : _mostrarErroMicrofone,
+                  child: Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: !_speechDisponivel
+                          ? Colors.grey.shade600
+                          : (_ouvindo ? Colors.red : Colors.green.shade600),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Icon(
+                      !_speechDisponivel
+                          ? Icons.mic_off
+                          : (_ouvindo ? Icons.mic : Icons.mic_none),
+                      color: Colors.white,
+                      size: 22,
                     ),
                   ),
-                ],
+                ),
               ],
             ),
           ),
-          // Indicador de escuta
+          // Indicador de escuta ou erro do microfone
           if (_ouvindo)
             Container(
               padding: const EdgeInsets.symmetric(vertical: 6),
@@ -1635,6 +1888,32 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                     ),
                   ),
                 ],
+              ),
+            )
+          else if (!_speechDisponivel)
+            GestureDetector(
+              onTap: _mostrarErroMicrofone,
+              child: Container(
+                padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 12),
+                color: Colors.orange.shade700,
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    const Icon(Icons.warning_amber, color: Colors.white, size: 16),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(
+                        'Microfone indisponível - Toque para mais informações',
+                        style: GoogleFonts.roboto(
+                          color: Colors.white,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w500,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ),
           // Lista de resultados

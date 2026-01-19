@@ -4,7 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
-import '../main.dart' show pararModoKiosk;
+import '../main.dart' show pararModoKiosk, KioskController, KioskEscapeZone;
 import '../services/config_service.dart';
 import '../services/database_service.dart';
 import 'config_screen.dart';
@@ -372,13 +372,129 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  /// Chamado quando o usuário ativa o mecanismo de escape (5 toques rápidos no canto)
+  void _onKioskEscape() async {
+    // Pausar modo imersivo para mostrar barras do sistema
+    KioskController.pausarModoImersivo();
+
+    // Mostrar barras do sistema
+    SystemChrome.setEnabledSystemUIMode(
+      SystemUiMode.manual,
+      overlays: SystemUiOverlay.values,
+    );
+
+    // Mostrar diálogo de confirmação
+    final confirmar = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF37474F),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.orange.shade700,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.lock_open, color: Colors.white, size: 24),
+            ),
+            const SizedBox(width: 12),
+            Text(
+              'Modo Kiosk',
+              style: GoogleFonts.roboto(
+                color: Colors.white,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'O modo kiosk foi temporariamente pausado.',
+              style: GoogleFonts.roboto(color: Colors.white70),
+            ),
+            const SizedBox(height: 12),
+            Text(
+              'Você pode acessar o sistema Android normalmente agora.',
+              style: GoogleFonts.roboto(color: Colors.white70, fontSize: 13),
+            ),
+            const SizedBox(height: 16),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.blue.withValues(alpha: 0.15),
+                borderRadius: BorderRadius.circular(8),
+                border: Border.all(color: Colors.blue.shade300),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.info_outline, color: Colors.blue, size: 20),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      'Para reativar, toque em "Reativar Kiosk" ou reinicie o app.',
+                      style: GoogleFonts.roboto(
+                        color: Colors.blue.shade200,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () async {
+              // Parar kiosk completamente e sair
+              await pararModoKiosk();
+              if (context.mounted) {
+                Navigator.pop(context, false);
+                SystemNavigator.pop();
+              }
+            },
+            child: Text(
+              'Sair do App',
+              style: TextStyle(color: Colors.red.shade300),
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.green.shade600,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Reativar Kiosk'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmar == true) {
+      // Reativar modo kiosk
+      KioskController.resumirModoImersivo();
+      KioskController.aplicarModoImersivo();
+      await KioskController.iniciar();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF546E7A),
-      body: SafeArea(
-        child: Stack(
-          children: [
+    return KioskEscapeZone(
+      toquesNecessarios: 5,
+      tempoLimite: const Duration(seconds: 3),
+      onEscape: _onKioskEscape,
+      child: Scaffold(
+        backgroundColor: const Color(0xFF546E7A),
+        body: SafeArea(
+          child: Stack(
+            children: [
             // Logo de fundo (se configurado)
             if (_logoLojaPath != null)
               Positioned.fill(
@@ -591,6 +707,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ],
         ),
+      ),
       ),
     );
   }

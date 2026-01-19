@@ -9,7 +9,8 @@
       "Bash(dir /b /s \"F:\\\\ProjetosFlutter\")",
       "Bash(findstr:*)",
       "WebSearch",
-      "WebFetch(domain:pub.dev)"
+      "WebFetch(domain:pub.dev)",
+      "Bash(flutter pub add:*)"
     ]
   }
 }
