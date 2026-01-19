@@ -7,10 +7,9 @@ enum TipoFiltroGrupo {
 
 /// Filtro de produtos para exibicao
 enum FiltroEstoqueDesconto {
-  todos,           // Todos os produtos
-  somenteEstoque,  // Somente com estoque
-  somenteDesconto, // Somente com desconto
-  estoqueEDesconto, // Com estoque E com desconto
+  todos,           // Todos os produtos e combos
+  comDesconto,     // Somente com desconto
+  descontoEEstoque, // Com desconto e estoque
 }
 
 /// Representa um grupo de exibicao de promocoes
@@ -51,13 +50,11 @@ class GrupoExibicao {
   String get filtroDescricao {
     switch (filtro) {
       case FiltroEstoqueDesconto.todos:
-        return 'Todos os produtos';
-      case FiltroEstoqueDesconto.somenteEstoque:
-        return 'Somente com estoque';
-      case FiltroEstoqueDesconto.somenteDesconto:
+        return 'Todos os produtos e combos';
+      case FiltroEstoqueDesconto.comDesconto:
         return 'Somente com desconto';
-      case FiltroEstoqueDesconto.estoqueEDesconto:
-        return 'Com estoque e desconto';
+      case FiltroEstoqueDesconto.descontoEEstoque:
+        return 'Com desconto e estoque';
     }
   }
 

@@ -556,10 +556,13 @@ class DatabaseService {
         maiorDescontoLote = lotesDesconto.first.percDesconto;
       }
 
-      // Calcular dias restantes da promocao
+      // Calcular dias restantes da promocao (comparando apenas datas, sem horas)
       int? diasRestantesPromocao;
       if (dataFimPromocao != null) {
-        diasRestantesPromocao = dataFimPromocao.difference(DateTime.now()).inDays;
+        final hoje = DateTime.now();
+        final hojeApenasDia = DateTime(hoje.year, hoje.month, hoje.day);
+        final fimApenasDia = DateTime(dataFimPromocao.year, dataFimPromocao.month, dataFimPromocao.day);
+        diasRestantesPromocao = fimApenasDia.difference(hojeApenasDia).inDays;
       }
 
       return {
@@ -681,7 +684,10 @@ class DatabaseService {
             ) AS preco_tabloide_raw,
 
             /* Descricao do tabloide */
-            COALESCE(tbl_prod.tabloide_desc, tbl_grupo.tabloide_desc) AS tabloide_desc
+            COALESCE(tbl_prod.tabloide_desc, tbl_grupo.tabloide_desc) AS tabloide_desc,
+
+            /* Data fim do tabloide */
+            COALESCE(tbl_prod.tabloide_data_fim, tbl_grupo.tabloide_data_fim) AS tabloide_data_fim
 
         FROM produto p
         LEFT JOIN grupo_preco_produto gpp ON gpp.produto_id = p.produto_id AND gpp.grupo_preco_id = ?
@@ -738,7 +744,8 @@ class DatabaseService {
                         ELSE gpp2.preco_vnd
                     END
                 ) AS preco_tabloide,
-                MAX(t.descricao) AS tabloide_desc
+                MAX(t.descricao) AS tabloide_desc,
+                MIN(t.vigencia_ate) AS tabloide_data_fim
             FROM tabloide t
             JOIN tabloide_filial tf ON tf.tabloide_id = t.tabloide_id
             JOIN tabloide_produto tdp ON tdp.tabloide_id = t.tabloide_id
@@ -769,7 +776,8 @@ class DatabaseService {
                         ELSE gpp3.preco_vnd
                     END
                 ) AS preco_tabloide,
-                MAX(t.descricao) AS tabloide_desc
+                MAX(t.descricao) AS tabloide_desc,
+                MIN(t.vigencia_ate) AS tabloide_data_fim
             FROM tabloide t
             JOIN tabloide_filial tf ON tf.tabloide_id = t.tabloide_id
             JOIN produto p3 ON p3.produto_id = ?
@@ -850,6 +858,11 @@ class DatabaseService {
       final precoTabloide = (precoTabloideBruto != null && precoTabloideBruto < 999999999)
           ? precoTabloideBruto : null;
       final tabloideDesc = row['tabloide_desc']?.toString();
+      DateTime? dataFimTabloide;
+      final dataTabloideRaw = row['tabloide_data_fim'];
+      if (dataTabloideRaw != null) {
+        dataFimTabloide = dataTabloideRaw is DateTime ? dataTabloideRaw : DateTime.tryParse(dataTabloideRaw.toString());
+      }
 
       // Calcular candidatos
       final List<double> candidatos = [];
@@ -928,6 +941,8 @@ class DatabaseService {
         dataFimPromocao = dataFimPromoFilial;
       } else if (origemPreco == 'PROMOCAO' && dataFimPromoCadastro != null) {
         dataFimPromocao = dataFimPromoCadastro;
+      } else if (origemPreco.contains('TABLOIDE') && dataFimTabloide != null) {
+        dataFimPromocao = dataFimTabloide;
       }
 
       return {
@@ -1317,6 +1332,258 @@ class DatabaseService {
       return lotes;
     } catch (e) {
       debugPrint('[DatabaseService] Erro ao buscar lotes com desconto: $e');
+      return [];
+    }
+  }
+
+  /// Busca combos/kits ativos para exibicao no carrossel
+  static Future<List<Map<String, dynamic>>> buscarCombosParaCarrossel({
+    required bool somenteComEstoque,
+  }) async {
+    try {
+      final conn = await getConnection();
+      if (conn == null || _filialId == null || _grupoPrecoId == null) return [];
+
+      // Determinar o dia da semana
+      final diaSemana = DateTime.now().weekday;
+      final colunaDia = switch (diaSemana) {
+        1 => 'dia_segunda',
+        2 => 'dia_terca',
+        3 => 'dia_quarta',
+        4 => 'dia_quinta',
+        5 => 'dia_sexta',
+        6 => 'dia_sabado',
+        7 => 'dia_domingo',
+        _ => 'dia_segunda',
+      };
+
+      // Buscar kits/combos ativos
+      final results = await conn.query('''
+        SELECT DISTINCT
+          kp.kit_promo_id,
+          kp.descricao,
+          kp.vigencia_ate,
+          (
+            SELECT GROUP_CONCAT(
+              CONCAT(
+                COALESCE(p.descricao, gp.descricao),
+                ' (', COALESCE(kpp2.quantidade, kpgp2.quantidade, 1), ')'
+              )
+              SEPARATOR ' + '
+            )
+            FROM kit_promo kp2
+            LEFT JOIN kit_promo_produto kpp2 ON kpp2.kit_promo_id = kp2.kit_promo_id AND kpp2.apagado = 'N'
+            LEFT JOIN produto p ON p.produto_id = kpp2.produto_id AND p.apagado = 'N'
+            LEFT JOIN kit_promo_grupo_precos kpgp2 ON kpgp2.kit_promo_id = kp2.kit_promo_id AND kpgp2.apagado = 'N'
+            LEFT JOIN grupo_precos gp ON gp.grupo_precos_id = kpgp2.grupo_precos_id
+            WHERE kp2.kit_promo_id = kp.kit_promo_id
+            LIMIT 3
+          ) as produtos_resumo,
+          (
+            SELECT COUNT(DISTINCT COALESCE(kpp3.produto_id, kpgp3.grupo_precos_id))
+            FROM kit_promo kp3
+            LEFT JOIN kit_promo_produto kpp3 ON kpp3.kit_promo_id = kp3.kit_promo_id AND kpp3.apagado = 'N'
+            LEFT JOIN kit_promo_grupo_precos kpgp3 ON kpgp3.kit_promo_id = kp3.kit_promo_id AND kpgp3.apagado = 'N'
+            WHERE kp3.kit_promo_id = kp.kit_promo_id
+          ) as qtd_itens
+        FROM kit_promo kp
+        INNER JOIN kit_promo_filial kpf ON kpf.kit_promo_id = kp.kit_promo_id
+          AND (kpf.filial_id = 0 OR kpf.filial_id = ?)
+          AND kpf.apagado = 'N'
+        WHERE kp.apagado = 'N'
+          AND kp.ativo = 'S'
+          AND kp.venda_apenas_cod_kitpromo = 'N'
+          AND kp.vigencia_de <= CURRENT_DATE
+          AND kp.vigencia_ate >= CURRENT_DATE
+          AND kp.$colunaDia = 'S'
+        ORDER BY kp.descricao
+      ''', [_filialId]);
+
+      final List<Map<String, dynamic>> combos = [];
+      for (final row in results) {
+        final kitPromoId = (row['kit_promo_id'] as num?)?.toInt() ?? 0;
+        final descricao = row['descricao']?.toString() ?? '';
+        final produtosResumo = row['produtos_resumo']?.toString() ?? '';
+        final qtdItens = (row['qtd_itens'] as num?)?.toInt() ?? 0;
+
+        // Buscar todos os produtos do combo
+        final produtosCombo = await _buscarProdutosDoComboParaCarrossel(
+          conn,
+          kitPromoId,
+        );
+
+        // Buscar grupos de preco do combo
+        final gruposPrecoCombo = await _buscarGruposPrecoDoComboParaCarrossel(
+          conn,
+          kitPromoId,
+        );
+
+        // Verificar estoque se necessario
+        if (somenteComEstoque) {
+          // Regra 1: TODOS os produtos diretos devem ter estoque >= quantidade necessaria
+          if (produtosCombo.isNotEmpty) {
+            final todosProdutosTenhoEstoque = produtosCombo.every(
+              (p) => (p['estoque'] as int? ?? 0) >= (p['quantidade'] as int? ?? 1)
+            );
+            if (!todosProdutosTenhoEstoque) {
+              continue; // Pular combo se algum produto nao tem estoque suficiente
+            }
+          }
+
+          // Regra 2: Para grupos de preco, ALGUM produto do grupo deve ter estoque
+          if (gruposPrecoCombo.isNotEmpty) {
+            final algumGrupoTemEstoque = gruposPrecoCombo.any(
+              (g) => (g['temProdutoComEstoque'] as bool? ?? false)
+            );
+            if (!algumGrupoTemEstoque) {
+              continue; // Pular combo se nenhum grupo tem produto com estoque
+            }
+          }
+        }
+
+        // Pular combos sem produtos e sem grupos
+        if (produtosCombo.isEmpty && gruposPrecoCombo.isEmpty) {
+          continue;
+        }
+
+        // Calcular data fim
+        DateTime? dataFim;
+        int? diasRestantes;
+        final vigenciaAte = row['vigencia_ate'];
+        if (vigenciaAte != null) {
+          if (vigenciaAte is DateTime) {
+            dataFim = vigenciaAte;
+          } else {
+            dataFim = DateTime.tryParse(vigenciaAte.toString());
+          }
+          if (dataFim != null) {
+            final hoje = DateTime.now();
+            final hojeApenasDia = DateTime(hoje.year, hoje.month, hoje.day);
+            final fimApenasDia = DateTime(dataFim.year, dataFim.month, dataFim.day);
+            diasRestantes = fimApenasDia.difference(hojeApenasDia).inDays;
+          }
+        }
+
+        combos.add({
+          'kitPromoId': kitPromoId,
+          'descricao': descricao,
+          'produtosResumo': produtosResumo,
+          'qtdItens': qtdItens,
+          'produtos': produtosCombo,
+          'gruposPreco': gruposPrecoCombo,
+          'dataFim': dataFim?.toIso8601String(),
+          'diasRestantes': diasRestantes,
+          'isCombo': true,
+        });
+      }
+
+      debugPrint('[Carrossel DB] Combos encontrados: ${combos.length}');
+      return combos;
+    } catch (e) {
+      debugPrint('[DatabaseService] Erro ao buscar combos para carrossel: $e');
+      return [];
+    }
+  }
+
+  /// Busca produtos de um combo para exibicao no carrossel
+  static Future<List<Map<String, dynamic>>> _buscarProdutosDoComboParaCarrossel(
+    MySqlConnection conn,
+    int kitPromoId,
+  ) async {
+    try {
+      // Buscar TODOS os produtos do combo
+      final results = await conn.query('''
+        SELECT
+          kpp.produto_id,
+          p.descricao,
+          COALESCE(kpp.quantidade, 1) as quantidade,
+          COALESCE(gpp.preco_vnd, 0) as preco_original,
+          kpp.preco as preco_kit,
+          COALESCE(em.estoque, 0) as estoque
+        FROM kit_promo_produto kpp
+        INNER JOIN produto p ON p.produto_id = kpp.produto_id AND p.apagado = 'N'
+        LEFT JOIN grupo_preco_produto gpp ON gpp.produto_id = kpp.produto_id AND gpp.grupo_preco_id = ?
+        LEFT JOIN estoque_minimo em ON em.produto_id = kpp.produto_id AND em.filial_id = ?
+        WHERE kpp.kit_promo_id = ?
+          AND kpp.apagado = 'N'
+        ORDER BY p.descricao
+      ''', [_grupoPrecoId, _filialId, kitPromoId]);
+
+      final List<Map<String, dynamic>> produtos = [];
+      for (final row in results) {
+        final precoOriginal = (row['preco_original'] as num?)?.toDouble() ?? 0;
+        final precoKit = (row['preco_kit'] as num?)?.toDouble();
+
+        // Calcular desconto percentual
+        double descontoPerc = 0;
+        if (precoKit != null && precoKit > 0 && precoOriginal > 0) {
+          descontoPerc = ((precoOriginal - precoKit) / precoOriginal) * 100;
+          if (descontoPerc < 0) descontoPerc = 0;
+        }
+
+        produtos.add({
+          'produtoId': (row['produto_id'] as num?)?.toInt() ?? 0,
+          'descricao': row['descricao']?.toString() ?? '',
+          'quantidade': (row['quantidade'] as num?)?.toInt() ?? 1,
+          'precoOriginal': precoOriginal,
+          'precoKit': precoKit,
+          'descontoPerc': descontoPerc,
+          'estoque': (row['estoque'] as num?)?.toInt() ?? 0,
+        });
+      }
+
+      return produtos;
+    } catch (e) {
+      debugPrint('[DatabaseService] Erro ao buscar produtos do combo para carrossel: $e');
+      return [];
+    }
+  }
+
+  /// Busca grupos de preco de um combo e verifica se tem produtos com estoque
+  static Future<List<Map<String, dynamic>>> _buscarGruposPrecoDoComboParaCarrossel(
+    MySqlConnection conn,
+    int kitPromoId,
+  ) async {
+    try {
+      // Buscar grupos de preco do combo
+      final results = await conn.query('''
+        SELECT
+          kpgp.grupo_precos_id,
+          gp.descricao,
+          COALESCE(kpgp.quantidade, 1) as quantidade,
+          kpgp.preco as preco_kit,
+          (
+            SELECT COUNT(*)
+            FROM produto p2
+            INNER JOIN estoque_minimo em2 ON em2.produto_id = p2.produto_id AND em2.filial_id = ?
+            WHERE p2.grupo_precos_id = kpgp.grupo_precos_id
+              AND p2.apagado = 'N'
+              AND p2.inativo = 'N'
+              AND em2.estoque >= COALESCE(kpgp.quantidade, 1)
+          ) as qtd_produtos_com_estoque
+        FROM kit_promo_grupo_precos kpgp
+        INNER JOIN grupo_precos gp ON gp.grupo_precos_id = kpgp.grupo_precos_id
+        WHERE kpgp.kit_promo_id = ?
+          AND kpgp.apagado = 'N'
+        ORDER BY gp.descricao
+      ''', [_filialId, kitPromoId]);
+
+      final List<Map<String, dynamic>> grupos = [];
+      for (final row in results) {
+        final qtdProdutosComEstoque = (row['qtd_produtos_com_estoque'] as num?)?.toInt() ?? 0;
+
+        grupos.add({
+          'grupoPrecoId': (row['grupo_precos_id'] as num?)?.toInt() ?? 0,
+          'descricao': row['descricao']?.toString() ?? '',
+          'quantidade': (row['quantidade'] as num?)?.toInt() ?? 1,
+          'precoKit': (row['preco_kit'] as num?)?.toDouble(),
+          'temProdutoComEstoque': qtdProdutosComEstoque > 0,
+        });
+      }
+
+      return grupos;
+    } catch (e) {
+      debugPrint('[DatabaseService] Erro ao buscar grupos de preco do combo: $e');
       return [];
     }
   }
@@ -1712,7 +1979,11 @@ class DatabaseService {
             if (dataFimStr != null) {
               dataFimPromocao = DateTime.tryParse(dataFimStr);
               if (dataFimPromocao != null) {
-                diasRestantesPromocao = dataFimPromocao.difference(DateTime.now()).inDays;
+                // Comparar apenas datas, sem horas
+                final hoje = DateTime.now();
+                final hojeApenasDia = DateTime(hoje.year, hoje.month, hoje.day);
+                final fimApenasDia = DateTime(dataFimPromocao.year, dataFimPromocao.month, dataFimPromocao.day);
+                diasRestantesPromocao = fimApenasDia.difference(hojeApenasDia).inDays;
               }
             }
           } else {
@@ -1923,6 +2194,7 @@ class DatabaseService {
         'empresaId': codEmpAdm, // ID da empresa no PEC (codempadm)
         'lgpdId': lgpdId,
         'lgpdSenha': lgpdSenha,
+        'nomeOperadora': operadoraNome, // Nome da operadora para exibicao
       };
     } catch (e) {
       debugPrint('[PEC Config] Erro ao buscar configuracao: $e');

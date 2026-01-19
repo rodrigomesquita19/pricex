@@ -14,6 +14,12 @@ class ConfigService {
   static const String _pecCartaoKey = 'pec_cartao';
   static const String _pecAtivoKey = 'pec_ativo';
 
+  // Chave do logo da loja
+  static const String _logoLojaKey = 'logo_loja_path';
+
+  // Chave para exibicao de combos no carrossel
+  static const String _combosCarrosselAtivoKey = 'combos_carrossel_ativo';
+
   /// Salva a configuracao do banco de dados
   static Future<void> saveConfig(DatabaseConfig config) async {
     final prefs = await SharedPreferences.getInstance();
@@ -126,16 +132,65 @@ class ConfigService {
     return prefs.getBool(_carrosselAtivoKey) ?? false;
   }
 
-  /// Salva o tempo de exibicao do carrossel (em segundos)
-  static Future<void> saveTempoCarrossel(int segundos) async {
+  /// Salva a velocidade do carrossel (nivel 1-9, onde 5 e o padrao)
+  static Future<void> saveVelocidadeCarrossel(int nivel) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setInt(_tempoCarrosselKey, segundos);
+    await prefs.setInt(_tempoCarrosselKey, nivel);
   }
 
-  /// Obtem o tempo de exibicao do carrossel (padrao: 10 segundos)
-  static Future<int> getTempoCarrossel() async {
+  /// Obtem a velocidade do carrossel (padrao: nivel 5)
+  static Future<int> getVelocidadeCarrossel() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getInt(_tempoCarrosselKey) ?? 10;
+    final valor = prefs.getInt(_tempoCarrosselKey) ?? 5;
+    // Se for valor antigo (tempo em segundos), converter para nivel padrao
+    if (valor > 9) return 5;
+    return valor;
+  }
+
+  /// Retorna o incremento de pixels por frame baseado no nivel de velocidade
+  static double getIncrementoVelocidade(int nivel) {
+    switch (nivel) {
+      case 1: return 0.25;  // Muito Lento
+      case 2: return 0.5;   // Lento
+      case 3: return 0.75;  // Moderado
+      case 4: return 0.85;  // Normal-
+      case 5: return 1.0;   // Padrao
+      case 6: return 1.25;  // Normal+
+      case 7: return 1.5;   // Rapido
+      case 8: return 2.0;   // Muito Rapido
+      case 9: return 3.0;   // Ultra Rapido
+      default: return 1.0;
+    }
+  }
+
+  /// Retorna o nome da velocidade baseado no nivel
+  static String getNomeVelocidade(int nivel) {
+    switch (nivel) {
+      case 1: return 'Muito Lento';
+      case 2: return 'Lento';
+      case 3: return 'Moderado';
+      case 4: return 'Normal-';
+      case 5: return 'Padrão';
+      case 6: return 'Normal+';
+      case 7: return 'Rápido';
+      case 8: return 'Muito Rápido';
+      case 9: return 'Ultra Rápido';
+      default: return 'Padrão';
+    }
+  }
+
+  // ===== COMBOS NO CARROSSEL =====
+
+  /// Salva se os combos devem ser exibidos no carrossel
+  static Future<void> saveCombosCarrosselAtivo(bool ativo) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_combosCarrosselAtivoKey, ativo);
+  }
+
+  /// Verifica se os combos devem ser exibidos no carrossel
+  static Future<bool> isCombosCarrosselAtivo() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getBool(_combosCarrosselAtivoKey) ?? true; // Ativo por padrao
   }
 
   // ===== CONFIGURACAO PEC =====
@@ -168,5 +223,25 @@ class ConfigService {
   static Future<bool> hasPecConfig() async {
     final cartao = await getCartaoPec();
     return cartao != null && cartao.isNotEmpty;
+  }
+
+  // ===== LOGO DA LOJA =====
+
+  /// Salva o caminho do logo da loja
+  static Future<void> saveLogoLoja(String path) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_logoLojaKey, path);
+  }
+
+  /// Obtem o caminho do logo da loja
+  static Future<String?> getLogoLoja() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_logoLojaKey);
+  }
+
+  /// Remove o logo da loja
+  static Future<void> removeLogoLoja() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_logoLojaKey);
   }
 }

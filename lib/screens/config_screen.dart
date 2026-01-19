@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:image_picker/image_picker.dart';
 import '../models/database_config.dart';
 import '../services/config_service.dart';
 import '../services/database_service.dart';
@@ -35,6 +36,9 @@ class _ConfigScreenState extends State<ConfigScreen> {
   // PEC (Programa de Economia Colaborativa)
   final _pecCartaoController = TextEditingController();
   bool _pecAtivo = false;
+
+  // Logo da loja
+  String? _logoLojaPath;
 
   @override
   void initState() {
@@ -106,6 +110,12 @@ class _ConfigScreenState extends State<ConfigScreen> {
       _pecCartaoController.text = pecCartao;
     }
     _pecAtivo = await ConfigService.isPecAtivo();
+
+    // Carregar logo da loja
+    _logoLojaPath = await ConfigService.getLogoLoja();
+    if (_logoLojaPath != null && !File(_logoLojaPath!).existsSync()) {
+      _logoLojaPath = null;
+    }
 
     setState(() => _isLoading = false);
   }
@@ -307,6 +317,60 @@ class _ConfigScreenState extends State<ConfigScreen> {
         _tabelaDescontoSelecionada = resultado['id'];
         _tabelaDescontoNome = resultado['descricao'];
       });
+    }
+  }
+
+  /// Seleciona uma imagem para usar como logo da loja
+  Future<void> _selecionarLogo() async {
+    try {
+      final picker = ImagePicker();
+      final XFile? pickedFile = await picker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 800,
+        maxHeight: 800,
+        imageQuality: 85,
+      );
+
+      if (pickedFile != null && mounted) {
+        // Salvar o caminho do logo
+        await ConfigService.saveLogoLoja(pickedFile.path);
+        setState(() {
+          _logoLojaPath = pickedFile.path;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Logo da loja atualizado'),
+            backgroundColor: Colors.green,
+            duration: Duration(seconds: 2),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Erro ao selecionar imagem: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  /// Remove o logo da loja
+  Future<void> _removerLogo() async {
+    await ConfigService.removeLogoLoja();
+    setState(() {
+      _logoLojaPath = null;
+    });
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Logo da loja removido'),
+          backgroundColor: Colors.orange,
+          duration: Duration(seconds: 2),
+        ),
+      );
     }
   }
 
@@ -946,6 +1010,143 @@ class _ConfigScreenState extends State<ConfigScreen> {
                               ),
                             ),
                           ),
+                        ],
+                      ),
+                    ),
+
+                    const SizedBox(height: 24),
+
+                    // Secao Logo da Loja
+                    Container(
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.grey.shade300,
+                            blurRadius: 4,
+                            offset: const Offset(0, 2),
+                          ),
+                        ],
+                      ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Row(
+                            children: [
+                              Icon(Icons.image, color: Colors.teal.shade700),
+                              const SizedBox(width: 8),
+                              const Text(
+                                'Logo da Loja',
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            'Selecione uma imagem para exibir como marca d\'agua na tela principal.',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Colors.grey.shade600,
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+
+                          // Preview do logo ou botao para selecionar
+                          if (_logoLojaPath != null)
+                            Column(
+                              children: [
+                                Container(
+                                  width: double.infinity,
+                                  height: 120,
+                                  decoration: BoxDecoration(
+                                    color: Colors.grey.shade200,
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(color: Colors.grey.shade300),
+                                  ),
+                                  child: ClipRRect(
+                                    borderRadius: BorderRadius.circular(8),
+                                    child: Image.file(
+                                      File(_logoLojaPath!),
+                                      fit: BoxFit.contain,
+                                      errorBuilder: (context, error, stackTrace) {
+                                        return Center(
+                                          child: Icon(
+                                            Icons.broken_image,
+                                            color: Colors.grey.shade400,
+                                            size: 48,
+                                          ),
+                                        );
+                                      },
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                Row(
+                                  children: [
+                                    Expanded(
+                                      child: OutlinedButton.icon(
+                                        onPressed: _selecionarLogo,
+                                        icon: const Icon(Icons.swap_horiz),
+                                        label: const Text('Trocar'),
+                                        style: OutlinedButton.styleFrom(
+                                          foregroundColor: Colors.teal.shade700,
+                                        ),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 12),
+                                    Expanded(
+                                      child: OutlinedButton.icon(
+                                        onPressed: _removerLogo,
+                                        icon: const Icon(Icons.delete_outline),
+                                        label: const Text('Remover'),
+                                        style: OutlinedButton.styleFrom(
+                                          foregroundColor: Colors.red.shade700,
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            )
+                          else
+                            InkWell(
+                              onTap: _selecionarLogo,
+                              borderRadius: BorderRadius.circular(8),
+                              child: Container(
+                                width: double.infinity,
+                                padding: const EdgeInsets.all(24),
+                                decoration: BoxDecoration(
+                                  border: Border.all(
+                                    color: Colors.teal.shade300,
+                                    style: BorderStyle.solid,
+                                  ),
+                                  borderRadius: BorderRadius.circular(8),
+                                  color: Colors.teal.shade50,
+                                ),
+                                child: Column(
+                                  children: [
+                                    Icon(
+                                      Icons.add_photo_alternate,
+                                      size: 48,
+                                      color: Colors.teal.shade400,
+                                    ),
+                                    const SizedBox(height: 8),
+                                    Text(
+                                      'Toque para selecionar imagem',
+                                      style: TextStyle(
+                                        color: Colors.teal.shade700,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
                         ],
                       ),
                     ),

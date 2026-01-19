@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -80,6 +81,8 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   Timer? _carrosselTimer;
   Timer? _carrosselRefreshTimer;
   bool _carrosselAtivo = false;
+  bool _combosCarrosselAtivo = true; // Exibir combos no carrossel
+  double _velocidadeCarrossel = 1.0; // Incremento de pixels por frame
   static const Duration _carrosselRefreshInterval = Duration(seconds: 60);
 
   // PEC (Programa de Economia Colaborativa)
@@ -87,6 +90,10 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   bool _pecAtivo = false;
   ResultadoConsultaPec? _resultadoPec;
   bool _consultandoPec = false;
+  String _nomeOperadoraPec = 'PEC'; // Nome da operadora para exibicao
+
+  // Logo da loja
+  String? _logoLojaPath;
 
   @override
   void initState() {
@@ -112,25 +119,114 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   Future<void> _inicializarCarrossel() async {
     debugPrint('[Carrossel] Inicializando carrossel...');
     _carrosselScrollController = ScrollController();
+    // Carregar velocidade configurada
+    final nivelVelocidade = await ConfigService.getVelocidadeCarrossel();
+    _velocidadeCarrossel = ConfigService.getIncrementoVelocidade(nivelVelocidade);
+    // Carregar config de combos
+    _combosCarrosselAtivo = await ConfigService.isCombosCarrosselAtivo();
+    debugPrint('[Carrossel] Velocidade: ${ConfigService.getNomeVelocidade(nivelVelocidade)} (incremento: $_velocidadeCarrossel)');
+    debugPrint('[Carrossel] Combos ativo: $_combosCarrosselAtivo');
     await _carregarProdutosCarrossel();
     _iniciarAnimacaoCarrossel();
     _iniciarRefreshCarrossel();
     debugPrint('[Carrossel] Inicializacao concluida. Produtos: ${_produtosCarrossel.length}');
   }
 
+  // Produtos pendentes para atualizar (carregados em background)
+  List<Map<String, dynamic>>? _produtosCarrosselPendentes;
+
   /// Inicia o timer de atualizacao automatica do carrossel (a cada 60 segundos)
   void _iniciarRefreshCarrossel() {
     _carrosselRefreshTimer?.cancel();
     _carrosselRefreshTimer = Timer.periodic(_carrosselRefreshInterval, (_) async {
       if (mounted && _carrosselAtivo) {
-        debugPrint('[Carrossel] Atualizando produtos automaticamente...');
-        await _carregarProdutosCarrossel();
-        if (mounted) {
-          setState(() {});
-          debugPrint('[Carrossel] Atualizacao concluida. Produtos: ${_produtosCarrossel.length}');
-        }
+        debugPrint('[Carrossel] Carregando produtos em background...');
+        await _carregarProdutosCarrosselBackground();
       }
     });
+  }
+
+  /// Carrega produtos em background sem atualizar a UI imediatamente
+  Future<void> _carregarProdutosCarrosselBackground() async {
+    try {
+      // Verificar se carrossel esta ativo
+      final ativo = await ConfigService.isCarrosselAtivo();
+      if (!ativo) return;
+
+      // Buscar grupos de exibicao ativos
+      final grupos = await ConfigService.getGruposExibicao();
+      final gruposAtivos = grupos.where((g) => g.ativo).toList();
+      if (gruposAtivos.isEmpty) return;
+
+      List<Map<String, dynamic>> novosProdutos = [];
+
+      for (final grupo in gruposAtivos) {
+        String tipoFiltro;
+        switch (grupo.tipo) {
+          case TipoFiltroGrupo.grupo:
+            tipoFiltro = 'grupo';
+            break;
+          case TipoFiltroGrupo.especificacao:
+            tipoFiltro = 'especificacao';
+            break;
+          case TipoFiltroGrupo.principioAtivo:
+            tipoFiltro = 'principio_ativo';
+            break;
+        }
+
+        String filtroEstoque;
+        switch (grupo.filtro) {
+          case FiltroEstoqueDesconto.todos:
+            filtroEstoque = 'todos';
+            break;
+          case FiltroEstoqueDesconto.comDesconto:
+            filtroEstoque = 'desconto';
+            break;
+          case FiltroEstoqueDesconto.descontoEEstoque:
+            filtroEstoque = 'estoque_desconto';
+            break;
+        }
+
+        final produtos = await DatabaseService.buscarProdutosParaCarrossel(
+          tipoFiltro: tipoFiltro,
+          ids: grupo.idsItens,
+          filtroEstoqueDesconto: filtroEstoque,
+          tabelaDescontoId: _tabelaDescontoId,
+          limite: 20,
+        );
+        novosProdutos.addAll(produtos);
+      }
+
+      // Buscar combos ativos se configurado
+      if (_combosCarrosselAtivo) {
+        final temFiltroEstoque = gruposAtivos.any(
+          (g) => g.filtro == FiltroEstoqueDesconto.descontoEEstoque
+        );
+        final combos = await DatabaseService.buscarCombosParaCarrossel(
+          somenteComEstoque: temFiltroEstoque,
+        );
+        novosProdutos.addAll(combos);
+      }
+
+      novosProdutos.shuffle();
+
+      // Armazenar para aplicar quando for seguro
+      _produtosCarrosselPendentes = novosProdutos;
+      debugPrint('[Carrossel] ${novosProdutos.length} itens carregados em background, aguardando momento seguro...');
+    } catch (e) {
+      debugPrint('[Carrossel] Erro ao carregar em background: $e');
+    }
+  }
+
+  /// Aplica os produtos pendentes (chamado quando scroll esta no inicio)
+  void _aplicarProdutosPendentes() {
+    if (_produtosCarrosselPendentes != null && mounted) {
+      setState(() {
+        _produtosCarrossel = _produtosCarrosselPendentes!;
+      });
+      debugPrint('[Carrossel] Produtos atualizados suavemente. Total: ${_produtosCarrossel.length}');
+      _produtosCarrosselPendentes = null;
+    }
   }
 
   /// Carrega os produtos para o carrossel baseado nos grupos configurados
@@ -183,13 +279,10 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
           case FiltroEstoqueDesconto.todos:
             filtroEstoque = 'todos';
             break;
-          case FiltroEstoqueDesconto.somenteEstoque:
-            filtroEstoque = 'estoque';
-            break;
-          case FiltroEstoqueDesconto.somenteDesconto:
+          case FiltroEstoqueDesconto.comDesconto:
             filtroEstoque = 'desconto';
             break;
-          case FiltroEstoqueDesconto.estoqueEDesconto:
+          case FiltroEstoqueDesconto.descontoEEstoque:
             filtroEstoque = 'estoque_desconto';
             break;
         }
@@ -207,10 +300,24 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
         todosProdutos.addAll(produtos);
       }
 
+      // Buscar combos ativos se configurado
+      if (_combosCarrosselAtivo) {
+        debugPrint('[Carrossel] Buscando combos ativos...');
+        // Verificar se algum grupo tem filtro de estoque
+        final temFiltroEstoque = gruposAtivos.any(
+          (g) => g.filtro == FiltroEstoqueDesconto.descontoEEstoque
+        );
+        final combos = await DatabaseService.buscarCombosParaCarrossel(
+          somenteComEstoque: temFiltroEstoque,
+        );
+        debugPrint('[Carrossel] Combos encontrados: ${combos.length}');
+        todosProdutos.addAll(combos);
+      }
+
       // Embaralhar para exibicao aleatoria
       todosProdutos.shuffle();
 
-      debugPrint('[Carrossel] TOTAL de produtos carregados: ${todosProdutos.length}');
+      debugPrint('[Carrossel] TOTAL de itens carregados (produtos + combos): ${todosProdutos.length}');
 
       if (mounted) {
         setState(() {
@@ -244,11 +351,15 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
         final currentScroll = _carrosselScrollController!.offset;
 
         if (currentScroll >= maxScroll) {
-          // Voltar ao inicio
+          // Voltar ao inicio - momento seguro para atualizar produtos
           _carrosselScrollController!.jumpTo(0);
+          // Aplicar produtos pendentes se houver
+          if (_produtosCarrosselPendentes != null) {
+            _aplicarProdutosPendentes();
+          }
         } else {
-          // Scroll suave
-          _carrosselScrollController!.jumpTo(currentScroll + 1);
+          // Scroll suave com velocidade configurada
+          _carrosselScrollController!.jumpTo(currentScroll + _velocidadeCarrossel);
         }
       }
     });
@@ -275,6 +386,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
           final empresaId = pecConfigDb['empresaId'] as int? ?? 0;
           final lgpdId = pecConfigDb['lgpdId'] as String? ?? '';
           final lgpdSenha = pecConfigDb['lgpdSenha'] as String? ?? '';
+          final nomeOperadora = pecConfigDb['nomeOperadora'] as String? ?? 'PEC';
 
           if (urlEndpoint.isNotEmpty && codAcesso.isNotEmpty) {
             final pecConfig = ConfiguracaoPec(
@@ -290,7 +402,8 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
               lgpdSenha: lgpdSenha,
             );
             _pecService = PecService(pecConfig);
-            debugPrint('[PEC] Servico PEC inicializado. Cartao/CPF: $cartaoPec, CNPJ: $cnpj, EmpresaId: $empresaId');
+            _nomeOperadoraPec = nomeOperadora.isNotEmpty ? nomeOperadora : 'PEC';
+            debugPrint('[PEC] Servico PEC inicializado. Operadora: $_nomeOperadoraPec, Cartao/CPF: $cartaoPec, CNPJ: $cnpj');
             debugPrint('[PEC] URL: $urlEndpoint');
           } else {
             debugPrint('[PEC] Configuracao PEC incompleta no banco, PEC desativado');
@@ -304,6 +417,12 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
         debugPrint('[PEC] Cartao PEC nao configurado, PEC desativado');
         _pecAtivo = false;
       }
+    }
+
+    // Carregar logo da loja
+    _logoLojaPath = await ConfigService.getLogoLoja();
+    if (_logoLojaPath != null && !File(_logoLojaPath!).existsSync()) {
+      _logoLojaPath = null; // Limpar se o arquivo nao existe mais
     }
 
     // Verificar se tem configuracao
@@ -324,15 +443,32 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   Future<void> _inicializarReconhecimentoVoz() async {
     _speechDisponivel = await _speech.initialize(
       onStatus: (status) {
+        debugPrint('[Speech] Status: $status');
         if (status == 'done' || status == 'notListening') {
           if (mounted) {
             setState(() => _ouvindo = false);
+            // Reiniciar automaticamente se ainda estiver no modo de busca por nome
+            if (!_modoBuscaCamera && _speechDisponivel) {
+              Future.delayed(const Duration(milliseconds: 500), () {
+                if (mounted && !_modoBuscaCamera && !_ouvindo) {
+                  _iniciarReconhecimentoVozContinuo();
+                }
+              });
+            }
           }
         }
       },
       onError: (error) {
         if (mounted) {
           setState(() => _ouvindo = false);
+          // Tentar reiniciar apos erro se ainda estiver no modo de busca
+          if (!_modoBuscaCamera && _speechDisponivel) {
+            Future.delayed(const Duration(seconds: 1), () {
+              if (mounted && !_modoBuscaCamera && !_ouvindo) {
+                _iniciarReconhecimentoVozContinuo();
+              }
+            });
+          }
         }
         debugPrint('[Speech] Erro: $error');
       },
@@ -340,6 +476,33 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     if (mounted) {
       setState(() {});
     }
+  }
+
+  /// Inicia o reconhecimento de voz em modo continuo (para busca por nome)
+  Future<void> _iniciarReconhecimentoVozContinuo() async {
+    if (!_speechDisponivel || _ouvindo || _modoBuscaCamera) return;
+
+    setState(() => _ouvindo = true);
+
+    await _speech.listen(
+      onResult: (result) {
+        if (result.finalResult) {
+          final texto = result.recognizedWords;
+          if (texto.isNotEmpty) {
+            _pesquisaController.text = texto;
+            _pesquisaController.selection = TextSelection.fromPosition(
+              TextPosition(offset: _pesquisaController.text.length),
+            );
+          }
+        }
+      },
+      localeId: 'pt_BR',
+      listenOptions: stt.SpeechListenOptions(
+        listenMode: stt.ListenMode.search,
+        cancelOnError: false,
+        partialResults: true,
+      ),
+    );
   }
 
   /// Inicia/para o reconhecimento de voz
@@ -355,32 +518,9 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     }
 
     if (_ouvindo) {
-      await _speech.stop();
-      setState(() => _ouvindo = false);
+      await _pararReconhecimentoVoz();
     } else {
-      setState(() => _ouvindo = true);
-
-      await _speech.listen(
-        onResult: (result) {
-          if (result.finalResult) {
-            final texto = result.recognizedWords;
-            if (texto.isNotEmpty) {
-              _pesquisaController.text = texto;
-              // Mover cursor para o final
-              _pesquisaController.selection = TextSelection.fromPosition(
-                TextPosition(offset: _pesquisaController.text.length),
-              );
-            }
-            setState(() => _ouvindo = false);
-          }
-        },
-        localeId: 'pt_BR',
-        listenOptions: stt.SpeechListenOptions(
-          listenMode: stt.ListenMode.search,
-          cancelOnError: true,
-          partialResults: false,
-        ),
-      );
+      await _iniciarReconhecimentoVozContinuo();
     }
   }
 
@@ -392,6 +532,31 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
 
     if (result == true) {
       _tabelaDescontoId = await ConfigService.getTabelaDescontoId();
+    }
+
+    // Sempre recarregar configuracoes do carrossel e logo ao voltar
+    final nivelVelocidade = await ConfigService.getVelocidadeCarrossel();
+    final novaVelocidade = ConfigService.getIncrementoVelocidade(nivelVelocidade);
+    if (novaVelocidade != _velocidadeCarrossel) {
+      debugPrint('[Carrossel] Velocidade atualizada: ${ConfigService.getNomeVelocidade(nivelVelocidade)} (incremento: $novaVelocidade)');
+      _velocidadeCarrossel = novaVelocidade;
+    }
+
+    // Recarregar config de combos
+    final novoCombosAtivo = await ConfigService.isCombosCarrosselAtivo();
+    if (novoCombosAtivo != _combosCarrosselAtivo) {
+      debugPrint('[Carrossel] Combos atualizado: $novoCombosAtivo');
+      _combosCarrosselAtivo = novoCombosAtivo;
+    }
+
+    // Recarregar logo da loja
+    final novoLogoPath = await ConfigService.getLogoLoja();
+    if (novoLogoPath != _logoLojaPath) {
+      setState(() {
+        _logoLojaPath = (novoLogoPath != null && File(novoLogoPath).existsSync())
+            ? novoLogoPath
+            : null;
+      });
     }
   }
 
@@ -590,23 +755,32 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
       _modoBuscaCamera = !_modoBuscaCamera;
 
       if (_modoBuscaCamera) {
-        // Voltando para modo camera
+        // Voltando para modo camera - parar reconhecimento de voz
         _pesquisaController.clear();
         _resultadosPesquisa = [];
         _cancelarTimerPesquisa();
+        _pararReconhecimentoVoz();
         _ativarCamera();
       } else {
         // Entrando no modo pesquisa
         _desativarCamera();
         _iniciarTimerPesquisa();
-        // Iniciar pesquisa por voz automaticamente
+        // Iniciar pesquisa por voz automaticamente (modo continuo)
         Future.delayed(const Duration(milliseconds: 300), () {
-          if (mounted && !_modoBuscaCamera && _speechDisponivel) {
-            _toggleReconhecimentoVoz();
+          if (mounted && !_modoBuscaCamera && _speechDisponivel && !_ouvindo) {
+            _iniciarReconhecimentoVozContinuo();
           }
         });
       }
     });
+  }
+
+  /// Para o reconhecimento de voz
+  Future<void> _pararReconhecimentoVoz() async {
+    if (_ouvindo) {
+      await _speech.stop();
+      setState(() => _ouvindo = false);
+    }
   }
 
   /// Inicia o timer de inatividade da pesquisa
@@ -773,9 +947,9 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
         MediaQuery.of(context).orientation == Orientation.landscape;
 
     return Scaffold(
-      backgroundColor: const Color(0xFF0D47A1),
+      backgroundColor: const Color(0xFF546E7A),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1565C0),
+        backgroundColor: const Color(0xFF78909C),
         title: Row(
           children: [
             const Icon(Icons.qr_code_scanner, color: Colors.white),
@@ -865,7 +1039,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     return Container(
       margin: const EdgeInsets.all(8),
       decoration: BoxDecoration(
-        color: const Color(0xFF0D47A1),
+        color: const Color(0xFF546E7A),
         borderRadius: BorderRadius.circular(16),
       ),
       child: Row(
@@ -1036,7 +1210,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
       onPanDown: (_) => _reiniciarTimerPesquisa(),
       child: Container(
         decoration: BoxDecoration(
-          color: const Color(0xFF1565C0),
+          color: const Color(0xFF78909C),
           borderRadius: BorderRadius.circular(16),
           border: Border.all(color: Colors.blue.shade300, width: 2),
         ),
@@ -1046,7 +1220,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
           // Campo de pesquisa compacto
           Container(
             padding: const EdgeInsets.all(8),
-            color: const Color(0xFF0D47A1),
+            color: const Color(0xFF546E7A),
             child: Row(
               children: [
                 Expanded(
@@ -1175,41 +1349,73 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
         onTap: () => _selecionarProduto(produto),
         borderRadius: BorderRadius.circular(8),
         child: Padding(
-          padding: const EdgeInsets.all(8),
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           child: Row(
             children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    // Badges
-                    if (temDescQtde || isPromo)
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 2),
-                        child: Wrap(
-                          spacing: 2,
-                          children: [
-                            if (isPromo)
-                              _buildMiniBadge('PROMO', Colors.green.shade600),
-                            if (temDescQtde)
-                              _buildMiniBadge('QTD', Colors.purple.shade600),
-                          ],
+              // Badges de promo/qtd (se houver)
+              if (isPromo || temDescQtde)
+                Padding(
+                  padding: const EdgeInsets.only(right: 6),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (isPromo)
+                        _buildMiniBadge('P', Colors.green.shade600),
+                      if (temDescQtde)
+                        Padding(
+                          padding: EdgeInsets.only(top: isPromo ? 2 : 0),
+                          child: _buildMiniBadge('Q', Colors.purple.shade600),
                         ),
-                      ),
+                    ],
+                  ),
+                ),
+              // Nome do produto
+              Expanded(
+                child: Text(
+                  descricao,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w500,
+                    color: estoque <= 0 ? Colors.grey : Colors.black87,
+                  ),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 6),
+              // Estoque no canto direito
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                decoration: BoxDecoration(
+                  color: estoque <= 0
+                      ? Colors.red.shade600
+                      : estoque <= 5
+                          ? Colors.orange.shade600
+                          : Colors.blue.shade600,
+                  borderRadius: BorderRadius.circular(4),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.inventory_2_outlined,
+                      color: Colors.white,
+                      size: 10,
+                    ),
+                    const SizedBox(width: 3),
                     Text(
-                      descricao,
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w500,
-                        color: estoque <= 0 ? Colors.grey : Colors.black87,
+                      '$estoque',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 9,
+                        fontWeight: FontWeight.bold,
                       ),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
                     ),
                   ],
                 ),
               ),
-              const Icon(Icons.chevron_right, size: 18, color: Colors.grey),
+              const SizedBox(width: 4),
+              const Icon(Icons.chevron_right, size: 16, color: Colors.grey),
             ],
           ),
         ),
@@ -1233,7 +1439,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
             // Fundo escuro (cor solida da loja)
             Positioned.fill(
               child: Container(
-                color: const Color(0xFF0D47A1), // Azul escuro da marca
+                color: const Color(0xFF546E7A), // Azul escuro da marca
               ),
             ),
 
@@ -1306,7 +1512,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 decoration: BoxDecoration(
-                  color: const Color(0xFF1565C0),
+                  color: const Color(0xFF78909C),
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Row(
@@ -1416,33 +1622,56 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   }
 
   Widget _buildEmptyState() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(
-            Icons.shopping_cart_outlined,
-            size: 64,
-            color: Colors.white.withValues(alpha: 0.3),
-          ),
-          const SizedBox(height: 12),
-          Text(
-            'Nenhum produto',
-            style: GoogleFonts.roboto(
-              color: Colors.white.withValues(alpha: 0.5),
-              fontSize: 16,
+    return Stack(
+      children: [
+        // Logo semi-transparente no fundo
+        if (_logoLojaPath != null)
+          Positioned.fill(
+            child: Center(
+              child: Opacity(
+                opacity: 0.15,
+                child: Image.file(
+                  File(_logoLojaPath!),
+                  width: 280,
+                  height: 280,
+                  fit: BoxFit.contain,
+                  errorBuilder: (context, error, stackTrace) {
+                    return const SizedBox.shrink();
+                  },
+                ),
+              ),
             ),
           ),
-          const SizedBox(height: 8),
-          Text(
-            'Use a camera ou pesquise',
-            style: GoogleFonts.roboto(
-              color: Colors.white.withValues(alpha: 0.3),
-              fontSize: 12,
-            ),
+        // Conteudo principal
+        Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                Icons.shopping_cart_outlined,
+                size: 64,
+                color: Colors.white.withValues(alpha: 0.3),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'Nenhum produto',
+                style: GoogleFonts.roboto(
+                  color: Colors.white.withValues(alpha: 0.5),
+                  fontSize: 16,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                'Use a camera ou pesquise',
+                style: GoogleFonts.roboto(
+                  color: Colors.white.withValues(alpha: 0.3),
+                  fontSize: 12,
+                ),
+              ),
+            ],
           ),
-        ],
-      ),
+        ),
+      ],
     );
   }
 
@@ -1499,8 +1728,10 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     final lotesDesconto = _produtoAtual!['lotesDesconto'] as List<dynamic>? ?? [];
     final maiorDescontoLote = (_produtoAtual!['maiorDescontoLote'] as num?)?.toDouble();
 
-    // Verificar se eh tabloide
+    // Verificar tipo de desconto
     final isTabloide = origemPreco.toUpperCase().contains('TABLOIDE');
+    final isDescontoAvista = origemPreco.toUpperCase().contains('DESC. A VISTA') ||
+                             origemPreco.toUpperCase().contains('DESC. REGRA');
 
     return SingleChildScrollView(
       padding: const EdgeInsets.all(12),
@@ -1523,7 +1754,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
               mainAxisSize: MainAxisSize.min,
               children: [
                 // Badges de promocao no topo
-            if (temDescontoQuantidade || temCombo || temLoteDesconto || isTabloide || _consultandoPec || (_resultadoPec != null && _resultadoPec!.temDesconto))
+            if (temDescontoQuantidade || temCombo || temLoteDesconto || isTabloide || isDescontoAvista || _consultandoPec || (_resultadoPec != null && _resultadoPec!.temDesconto))
               Padding(
                 padding: const EdgeInsets.only(bottom: 12),
                 child: Wrap(
@@ -1536,6 +1767,13 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                         icon: Icons.campaign,
                         label: 'TABLOIDE',
                         colors: [Colors.pink.shade600, Colors.pink.shade400],
+                      ),
+                    // Badge Desconto a Vista
+                    if (isDescontoAvista)
+                      _buildBadge(
+                        icon: Icons.payments,
+                        label: 'À VISTA',
+                        colors: [Colors.cyan.shade600, Colors.cyan.shade400],
                       ),
                     // Badge Desconto Quantidade
                     if (temDescontoQuantidade)
@@ -1558,14 +1796,14 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                         label: 'LOTE ${maiorDescontoLote.toStringAsFixed(0)}%',
                         colors: [Colors.teal.shade600, Colors.teal.shade400],
                       ),
-                    // Badge PEC
+                    // Badge PEC/Operadora
                     if (_resultadoPec != null && _resultadoPec!.temDesconto)
                       _buildBadge(
                         icon: Icons.card_membership,
-                        label: _resultadoPec!.isOfertaJornal ? 'JORNAL PEC' : 'PEC ${_resultadoPec!.descontoPercentual.toStringAsFixed(1)}%',
+                        label: _resultadoPec!.isOfertaJornal ? 'JORNAL $_nomeOperadoraPec' : '$_nomeOperadoraPec ${_resultadoPec!.descontoPercentual.toStringAsFixed(1)}%',
                         colors: [Colors.purple.shade700, Colors.purple.shade500],
                       ),
-                    // Indicador consultando PEC
+                    // Indicador consultando PEC/Operadora
                     if (_consultandoPec)
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -1586,7 +1824,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                             ),
                             const SizedBox(width: 6),
                             Text(
-                              'PEC...',
+                              '$_nomeOperadoraPec...',
                               style: TextStyle(
                                 fontSize: 10,
                                 color: Colors.purple.shade700,
@@ -1663,7 +1901,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                   style: GoogleFonts.roboto(
                     fontSize: 36,
                     fontWeight: FontWeight.bold,
-                    color: isPromocional ? Colors.green.shade700 : const Color(0xFF1565C0),
+                    color: isPromocional ? Colors.green.shade700 : const Color(0xFF78909C),
                   ),
                 ),
               ],
@@ -2761,7 +2999,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
 
     final precoPec = _resultadoPec!.precoFinalPec;
     final desconto = _resultadoPec!.descontoPercentual;
-    final programa = _resultadoPec!.nomePrograma ?? 'PEC';
+    final programa = _resultadoPec!.nomePrograma ?? _nomeOperadoraPec;
     final isJornal = _resultadoPec!.isOfertaJornal;
 
     // Verificar se o preco PEC eh melhor que o preco atual
@@ -2798,7 +3036,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      isJornal ? 'OFERTA JORNAL PEC' : 'DESCONTO PEC',
+                      isJornal ? 'OFERTA JORNAL $_nomeOperadoraPec' : 'DESCONTO $_nomeOperadoraPec',
                       style: GoogleFonts.roboto(
                         fontSize: 12,
                         fontWeight: FontWeight.bold,
@@ -2848,7 +3086,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'PRECO COM CARTAO PEC',
+                        'PREÇO COM $_nomeOperadoraPec',
                         style: TextStyle(
                           fontSize: 9,
                           color: Colors.grey.shade600,
@@ -2926,13 +3164,13 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   /// Carrossel de promocoes estilo ticker/marquee
   Widget _buildCarrosselPromocoes() {
     return Container(
-      color: const Color(0xFF1565C0),
+      color: const Color(0xFF78909C),
       child: Column(
         children: [
           // Header do carrossel
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-            color: const Color(0xFF0D47A1),
+            color: const Color(0xFF546E7A),
             child: Row(
               children: [
                 Icon(Icons.local_offer, color: Colors.yellow.shade600, size: 18),
@@ -2970,7 +3208,17 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
   }
 
   /// Item individual do carrossel de promocoes
-  Widget _buildCarrosselItem(Map<String, dynamic> produto) {
+  Widget _buildCarrosselItem(Map<String, dynamic> item) {
+    // Verificar se e um combo
+    if (item['isCombo'] == true) {
+      return _buildComboCard(item);
+    }
+    // E um produto normal
+    return _buildProdutoCard(item);
+  }
+
+  /// Card de produto individual no carrossel
+  Widget _buildProdutoCard(Map<String, dynamic> produto) {
     final descricao = produto['descricao'] ?? '';
     final precoCheio = (produto['precoCheio'] as num?)?.toDouble() ?? 0;
     final precoPraticado = (produto['precoPraticado'] as num?)?.toDouble() ?? 0;
@@ -2981,8 +3229,14 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
 
     // Info de promocao (data fim)
     final diasRestantesPromocao = (produto['diasRestantesPromocao'] as num?)?.toInt();
-    final promocaoAcabando = diasRestantesPromocao != null && diasRestantesPromocao <= 7 && diasRestantesPromocao >= 0;
+    final promocaoAcabando = diasRestantesPromocao != null && diasRestantesPromocao <= 15 && diasRestantesPromocao >= 0;
     final ultimoDia = diasRestantesPromocao == 0;
+
+    // Identificar tipo de desconto pela origem do preco
+    final origemPreco = produto['origemPreco'] as String? ?? 'NORMAL';
+    final isTabloide = origemPreco.toUpperCase().contains('TABLOIDE');
+    final isDescontoAvista = origemPreco.toUpperCase().contains('DESC. A VISTA') ||
+                             origemPreco.toUpperCase().contains('DESC. REGRA');
 
     // Info de desconto quantidade
     final temDescontoQuantidade = produto['temDescontoQuantidade'] == true;
@@ -2992,8 +3246,32 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
     final precoUnitarioComDescQtde = (produto['precoUnitarioComDescQtde'] as num?)?.toDouble();
     final qtdeMinimaDesconto = (produto['qtdeMinimaDesconto'] as num?)?.toInt();
 
-    // Card com destaque se tem algum desconto
-    final bool temAlgumDesconto = temDescontoPromocional || temDescontoQuantidade;
+    // Determinar cores do card baseado no tipo de desconto
+    List<Color> gradientColors;
+    Color? borderColor;
+    if (temDescontoQuantidade) {
+      if (tipoDescontoQtde == 'caixa_gratis') {
+        gradientColors = [Colors.purple.shade50, Colors.purple.shade100];
+        borderColor = Colors.purple.shade400;
+      } else {
+        gradientColors = [Colors.orange.shade50, Colors.orange.shade100];
+        borderColor = Colors.orange.shade400;
+      }
+    } else if (temDescontoPromocional) {
+      if (isTabloide) {
+        gradientColors = [Colors.blue.shade50, Colors.blue.shade100];
+        borderColor = Colors.blue.shade400;
+      } else if (isDescontoAvista) {
+        gradientColors = [Colors.cyan.shade50, Colors.cyan.shade100];
+        borderColor = Colors.cyan.shade400;
+      } else {
+        gradientColors = [Colors.green.shade50, Colors.green.shade100];
+        borderColor = Colors.green.shade400;
+      }
+    } else {
+      gradientColors = [Colors.white, Colors.grey.shade50];
+      borderColor = null;
+    }
 
     return Container(
       width: 300,
@@ -3002,20 +3280,11 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
         gradient: LinearGradient(
           begin: Alignment.topLeft,
           end: Alignment.bottomRight,
-          colors: temDescontoQuantidade
-              ? (tipoDescontoQtde == 'caixa_gratis'
-                  ? [Colors.purple.shade50, Colors.purple.shade100]
-                  : [Colors.orange.shade50, Colors.orange.shade100])
-              : [Colors.white, Colors.grey.shade50],
+          colors: gradientColors,
         ),
         borderRadius: BorderRadius.circular(10),
-        border: temDescontoQuantidade
-            ? Border.all(
-                color: tipoDescontoQtde == 'caixa_gratis'
-                    ? Colors.purple.shade400
-                    : Colors.orange.shade400,
-                width: 2,
-              )
+        border: borderColor != null
+            ? Border.all(color: borderColor, width: 2)
             : null,
         boxShadow: [
           BoxShadow(
@@ -3081,11 +3350,100 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
               ),
             ),
 
+          // Header com badge de promocao/tabloide/desconto a vista (quando NAO tem desconto quantidade)
+          if (temDescontoPromocional && !temDescontoQuantidade)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  colors: isTabloide
+                      ? [Colors.blue.shade600, Colors.blue.shade800]
+                      : isDescontoAvista
+                          ? [Colors.cyan.shade600, Colors.cyan.shade800]
+                          : [Colors.green.shade600, Colors.green.shade800],
+                ),
+                borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
+              ),
+              child: Row(
+                children: [
+                  Icon(
+                    isTabloide
+                        ? Icons.menu_book
+                        : isDescontoAvista
+                            ? Icons.payments
+                            : Icons.local_offer,
+                    color: Colors.white,
+                    size: 16,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      isTabloide
+                          ? 'OFERTA TABLOIDE'
+                          : isDescontoAvista
+                              ? 'DESCONTO À VISTA'
+                              : 'PROMOÇÃO',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.25),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text(
+                      '-${descontoPerc.toStringAsFixed(0)}%',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ),
+                  if (promocaoAcabando) ...[
+                    const SizedBox(width: 6),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
+                      decoration: BoxDecoration(
+                        color: ultimoDia ? Colors.red.shade700 : Colors.amber.shade700,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            ultimoDia ? Icons.warning_amber : Icons.schedule,
+                            color: Colors.white,
+                            size: 10,
+                          ),
+                          const SizedBox(width: 2),
+                          Text(
+                            ultimoDia ? 'ÚLTIMO DIA!' : '${diasRestantesPromocao}d',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 8,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+
           // Nome do produto
           Container(
             width: double.infinity,
-            padding: EdgeInsets.fromLTRB(10, temDescontoQuantidade ? 4 : 8, 10, 4),
-            decoration: temDescontoQuantidade
+            padding: EdgeInsets.fromLTRB(10, (temDescontoQuantidade || temDescontoPromocional) ? 4 : 8, 10, 4),
+            decoration: (temDescontoQuantidade || temDescontoPromocional)
                 ? null
                 : BoxDecoration(
                     color: Colors.grey.shade100,
@@ -3110,26 +3468,6 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
               padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
               child: Row(
                 children: [
-                  // Badge de desconto promocional (se houver)
-                  if (temDescontoPromocional && !temDescontoQuantidade)
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: Colors.red.shade600,
-                        borderRadius: BorderRadius.circular(6),
-                      ),
-                      child: Text(
-                        '-${descontoPerc.toStringAsFixed(0)}%',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                  if (temDescontoPromocional && !temDescontoQuantidade)
-                    const SizedBox(width: 8),
-
                   // Precos
                   Expanded(
                     child: temDescontoQuantidade
@@ -3186,7 +3524,7 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                                       Text(
                                         tipoDescontoQtde == 'caixa_gratis'
                                             ? ' lev. $qtdeMinimaDesconto'
-                                            : ' a partir de $qtdeMinimaDesconto',
+                                            : ' levando $qtdeMinimaDesconto',
                                         style: TextStyle(
                                           fontSize: 8,
                                           color: Colors.grey.shade600,
@@ -3216,7 +3554,11 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                                       'Por: ',
                                       style: TextStyle(
                                         fontSize: 9,
-                                        color: Colors.green.shade700,
+                                        color: isTabloide
+                                            ? Colors.blue.shade700
+                                            : isDescontoAvista
+                                                ? Colors.cyan.shade700
+                                                : Colors.green.shade700,
                                         fontWeight: FontWeight.w500,
                                       ),
                                     ),
@@ -3225,8 +3567,12 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                                     style: GoogleFonts.roboto(
                                       fontSize: 14,
                                       fontWeight: FontWeight.bold,
-                                      color: temAlgumDesconto
-                                          ? Colors.green.shade700
+                                      color: temDescontoPromocional
+                                          ? (isTabloide
+                                              ? Colors.blue.shade700
+                                              : isDescontoAvista
+                                                  ? Colors.cyan.shade700
+                                                  : Colors.green.shade700)
                                           : Colors.grey.shade700,
                                     ),
                                   ),
@@ -3235,39 +3581,329 @@ class _PriceScannerScreenState extends State<PriceScannerScreen>
                             ],
                           ),
                   ),
-
-                  // Badge de promocao acabando (quando aplicavel)
-                  if (promocaoAcabando && temDescontoPromocional && !temDescontoQuantidade)
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
-                      decoration: BoxDecoration(
-                        color: ultimoDia ? Colors.red.shade700 : Colors.amber.shade700,
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            ultimoDia ? Icons.warning_amber : Icons.schedule,
-                            color: Colors.white,
-                            size: 10,
-                          ),
-                          const SizedBox(width: 2),
-                          Text(
-                            ultimoDia
-                                ? 'ULTIMO DIA!'
-                                : 'Acaba em ${diasRestantesPromocao}d',
-                            style: const TextStyle(
-                              color: Colors.white,
-                              fontSize: 8,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
                 ],
               ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Card de combo/kit no carrossel
+  Widget _buildComboCard(Map<String, dynamic> combo) {
+    final descricao = combo['descricao'] ?? 'Combo';
+    final produtos = combo['produtos'] as List<dynamic>? ?? [];
+    final gruposPreco = combo['gruposPreco'] as List<dynamic>? ?? [];
+    final diasRestantes = (combo['diasRestantes'] as num?)?.toInt();
+    final promocaoAcabando = diasRestantes != null && diasRestantes <= 15 && diasRestantes >= 0;
+    final ultimoDia = diasRestantes == 0;
+
+    // Calcular economia total do combo
+    double precoTotalOriginal = 0;
+    double precoTotalCombo = 0;
+    for (final p in produtos) {
+      final prod = p as Map<String, dynamic>;
+      final quantidade = (prod['quantidade'] as num?)?.toInt() ?? 1;
+      final precoOriginal = (prod['precoOriginal'] as num?)?.toDouble() ?? 0;
+      final precoKit = (prod['precoKit'] as num?)?.toDouble() ?? precoOriginal;
+      precoTotalOriginal += precoOriginal * quantidade;
+      precoTotalCombo += precoKit * quantidade;
+    }
+    for (final g in gruposPreco) {
+      final grupo = g as Map<String, dynamic>;
+      final quantidade = (grupo['quantidade'] as num?)?.toInt() ?? 1;
+      final precoKit = (grupo['precoKit'] as num?)?.toDouble() ?? 0;
+      // Para grupos, usamos o preco do kit como referencia
+      precoTotalCombo += precoKit * quantidade;
+    }
+    final economiaTotal = precoTotalOriginal - precoTotalCombo;
+    final temEconomia = economiaTotal > 0.01;
+
+    // Combinar todos os itens (produtos + grupos)
+    final List<Widget> todosItens = [];
+    for (final p in produtos) {
+      todosItens.add(_buildComboProdutoItem(p as Map<String, dynamic>));
+    }
+    for (final g in gruposPreco) {
+      todosItens.add(_buildComboGrupoItem(g as Map<String, dynamic>));
+    }
+
+    // Decidir layout: 2 colunas se tiver 3+ itens
+    final usarDuasColunas = todosItens.length >= 3;
+
+    return Container(
+      width: 320,
+      margin: const EdgeInsets.symmetric(horizontal: 6, vertical: 6),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Colors.deepPurple.shade50, Colors.deepPurple.shade100],
+        ),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.deepPurple.shade400, width: 1.5),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withValues(alpha: 0.15),
+            blurRadius: 4,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Header do combo
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: [Colors.deepPurple.shade600, Colors.deepPurple.shade800],
+              ),
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(8)),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.auto_awesome, color: Colors.white, size: 18),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    descricao.length > 25 ? '${descricao.substring(0, 25)}...' : descricao,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withValues(alpha: 0.25),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: const Text(
+                    'COMBO',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 9,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+                // Dias restantes ao lado de COMBO
+                if (promocaoAcabando) ...[
+                  const SizedBox(width: 6),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: ultimoDia ? Colors.red : Colors.orange,
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(Icons.timer, size: 10, color: Colors.white),
+                        const SizedBox(width: 2),
+                        Text(
+                          ultimoDia ? 'ÚLTIMO DIA!' : '${diasRestantes}d',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 9,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+
+          // Conteudo - Lista de produtos
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.all(8),
+              child: usarDuasColunas
+                  ? _buildComboGridLayout(todosItens)
+                  : _buildComboListLayout(todosItens),
+            ),
+          ),
+
+          // Footer com economia total
+          if (temEconomia)
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              decoration: BoxDecoration(
+                color: Colors.green.shade600,
+                borderRadius: const BorderRadius.vertical(bottom: Radius.circular(8)),
+              ),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.savings, color: Colors.white, size: 16),
+                  const SizedBox(width: 6),
+                  Text(
+                    'ECONOMIZE ${_currencyFormat.format(economiaTotal)}',
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// Layout em lista (1 coluna) para poucos itens
+  Widget _buildComboListLayout(List<Widget> itens) {
+    return SingleChildScrollView(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: itens,
+      ),
+    );
+  }
+
+  /// Layout em grid (2 colunas) para 3+ itens
+  Widget _buildComboGridLayout(List<Widget> itens) {
+    // Dividir itens em 2 colunas
+    final List<Widget> colunaEsquerda = [];
+    final List<Widget> colunaDireita = [];
+    for (int i = 0; i < itens.length; i++) {
+      if (i % 2 == 0) {
+        colunaEsquerda.add(itens[i]);
+      } else {
+        colunaDireita.add(itens[i]);
+      }
+    }
+
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: colunaEsquerda,
+          ),
+        ),
+        const SizedBox(width: 6),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: colunaDireita,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// Item de produto dentro do card de combo (simplificado)
+  Widget _buildComboProdutoItem(Map<String, dynamic> produto) {
+    final descricao = produto['descricao'] ?? '';
+    final quantidade = (produto['quantidade'] as num?)?.toInt() ?? 1;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 3),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.7),
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: Row(
+        children: [
+          // Quantidade
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+            decoration: BoxDecoration(
+              color: Colors.deepPurple.shade100,
+              borderRadius: BorderRadius.circular(3),
+            ),
+            child: Text(
+              '${quantidade}x',
+              style: TextStyle(
+                fontSize: 8,
+                fontWeight: FontWeight.bold,
+                color: Colors.deepPurple.shade700,
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+          // Descricao
+          Expanded(
+            child: Text(
+              descricao,
+              style: const TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w500,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Item de grupo de preco dentro do card de combo (simplificado)
+  Widget _buildComboGrupoItem(Map<String, dynamic> grupo) {
+    final descricao = grupo['descricao'] ?? '';
+    final quantidade = (grupo['quantidade'] as num?)?.toInt() ?? 1;
+
+    return Container(
+      margin: const EdgeInsets.only(bottom: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 3),
+      decoration: BoxDecoration(
+        color: Colors.deepPurple.shade100,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: Colors.deepPurple.shade300, width: 0.5),
+      ),
+      child: Row(
+        children: [
+          // Icone de grupo
+          Icon(
+            Icons.category,
+            size: 10,
+            color: Colors.deepPurple.shade500,
+          ),
+          const SizedBox(width: 3),
+          // Quantidade
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
+            decoration: BoxDecoration(
+              color: Colors.deepPurple.shade200,
+              borderRadius: BorderRadius.circular(3),
+            ),
+            child: Text(
+              '${quantidade}x',
+              style: TextStyle(
+                fontSize: 8,
+                fontWeight: FontWeight.bold,
+                color: Colors.deepPurple.shade700,
+              ),
+            ),
+          ),
+          const SizedBox(width: 4),
+          // Descricao
+          Expanded(
+            child: Text(
+              descricao,
+              style: TextStyle(
+                fontSize: 9,
+                fontWeight: FontWeight.w500,
+                color: Colors.deepPurple.shade700,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
             ),
           ),
         ],

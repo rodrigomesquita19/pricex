@@ -37,6 +37,9 @@ dependencies:
   # HTTP para requisicoes PEC
   http: ^1.2.0
 
+  # Selecao de imagens
+  image_picker: ^1.0.7
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

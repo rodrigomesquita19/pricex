@@ -146,20 +146,26 @@ class PecService {
   }
 
   /// Abre uma transacao PEC
-  Future<PecResponse<TransacaoPec>> _abrirTransacao() async {
+  Future<PecResponse<TransacaoPec>> _abrirTransacao({bool usarCpf = false}) async {
+    // Se usarCpf=true, envia o CPF na tag CPF e deixa CARTAO vazio
+    final cartaoTag = usarCpf ? '' : config.cartaoPec;
+    final cpfTag = usarCpf ? config.cartaoPecOuCpf.replaceAll(RegExp(r'[^0-9]'), '') : '';
+
     final xmlBody = '<ABRIR_TRANSACAO_PARAM>'
         '<OPERADOR>${config.operador}</OPERADOR>'
         '$_credenciaisXml'
-        '<CARTAO>${config.cartaoPec}</CARTAO>'
-        '<CPF></CPF>'
+        '<CARTAO>$cartaoTag</CARTAO>'
+        '<CPF>$cpfTag</CPF>'
         '<NUM_BALCONISTA>${config.numBalconista}</NUM_BALCONISTA>'
         '<CNPJ>${config.cnpj}</CNPJ>'
         '</ABRIR_TRANSACAO_PARAM>';
 
     debugPrint('[PEC] ========== ABRIR TRANSACAO ==========');
+    debugPrint('[PEC] Modo: ${usarCpf ? "CPF direto" : "Numero do cartao"}');
     debugPrint('[PEC] URL Endpoint: ${config.urlEndpoint}');
     debugPrint('[PEC] SOAP Endpoint: $_soapEndpoint');
-    debugPrint('[PEC] CARTAO: ${config.cartaoPec}');
+    debugPrint('[PEC] CARTAO: $cartaoTag');
+    debugPrint('[PEC] CPF: $cpfTag');
     debugPrint('[PEC] CNPJ: ${config.cnpj}');
     debugPrint('[PEC] OPERADOR: ${config.operador}');
     debugPrint('[PEC] NUM_BALCONISTA: ${config.numBalconista}');
@@ -220,9 +226,11 @@ class PecService {
         if (cartoes.isNotEmpty) {
           // Busca cartao com CPF exato e liberado
           for (final cartao in cartoes) {
+            debugPrint('[PEC] Campos do cartao: $cartao');
             final titularCpf = cartao['TITULAR_CPF'] ?? '';
-            final numPec = cartao['NUMPEC'] ?? '';
-            final liberado = cartao['LIBERADO'] ?? '';
+            // Tenta diferentes tags para o numero do cartao (NUMPEC e NUM_CARTAO sao as mais comuns)
+            final numPec = cartao['NUMPEC'] ?? cartao['NUM_PEC'] ?? cartao['NUM_CARTAO'] ?? cartao['NUMERO_CARTAO'] ?? '';
+            final liberado = cartao['LIBERADO'] ?? cartao['SITUACAO'] ?? '';
             debugPrint('[PEC] Cartao: $numPec, CPF: $titularCpf, Liberado: $liberado');
 
             if (titularCpf == cpfLimpo && liberado == 'S' && numPec.isNotEmpty) {
@@ -233,19 +241,21 @@ class PecService {
 
           // Se nao encontrou exato, pega o primeiro liberado
           for (final cartao in cartoes) {
-            final numPec = cartao['NUMPEC'] ?? '';
-            final liberado = cartao['LIBERADO'] ?? '';
+            final numPec = cartao['NUMPEC'] ?? cartao['NUM_PEC'] ?? cartao['NUM_CARTAO'] ?? cartao['NUMERO_CARTAO'] ?? '';
+            final liberado = cartao['LIBERADO'] ?? cartao['SITUACAO'] ?? '';
             if (liberado == 'S' && numPec.isNotEmpty) {
               debugPrint('[PEC] Usando primeiro cartao liberado: $numPec');
               return numPec;
             }
           }
 
-          // Ultimo recurso: primeiro cartao
-          final primeiroCartao = cartoes.first['NUMPEC'] ?? '';
-          if (primeiroCartao.isNotEmpty) {
-            debugPrint('[PEC] Usando primeiro cartao: $primeiroCartao');
-            return primeiroCartao;
+          // Ultimo recurso: primeiro cartao (mesmo sem LIBERADO=S)
+          for (final cartao in cartoes) {
+            final numPec = cartao['NUMPEC'] ?? cartao['NUM_PEC'] ?? cartao['NUM_CARTAO'] ?? cartao['NUMERO_CARTAO'] ?? '';
+            if (numPec.isNotEmpty) {
+              debugPrint('[PEC] Usando primeiro cartao disponivel (sem verificar liberado): $numPec');
+              return numPec;
+            }
           }
         }
       } else {
@@ -268,21 +278,41 @@ class PecService {
       }
     }
 
-    // Se o valor configurado e um CPF, primeiro busca o numero do cartao
-    if (config.isCpf && config.cartaoPec == config.cartaoPecOuCpf) {
-      debugPrint('[PEC] Valor configurado parece ser CPF, buscando cartao...');
-      final cartaoNumero = await _consultarCartaoPorCpf(config.cartaoPecOuCpf);
-      if (cartaoNumero != null) {
-        config.cartaoNumero = cartaoNumero;
-        debugPrint('[PEC] Cartao encontrado: $cartaoNumero');
-      } else {
-        debugPrint('[PEC] Nao foi possivel encontrar cartao para o CPF');
-        return null;
+    // Se o valor configurado e um CPF, tenta primeiro abrir direto com CPF
+    if (config.isCpf) {
+      debugPrint('[PEC] Valor configurado e CPF, tentando abrir transacao com CPF direto...');
+
+      // Primeira tentativa: usar CPF diretamente
+      var result = await _abrirTransacao(usarCpf: true);
+      if (result.success && result.data != null) {
+        _transIdAtual = result.data!.transId;
+        _transIdExpiracao = DateTime.now().add(const Duration(minutes: 5));
+        debugPrint('[PEC] Transacao aberta com CPF direto!');
+        return _transIdAtual;
       }
+
+      debugPrint('[PEC] Falhou com CPF direto, tentando buscar numero do cartao...');
+
+      // Segunda tentativa: buscar numero do cartao e usar ele
+      final cartaoNumero = await _consultarCartaoPorCpf(config.cartaoPecOuCpf);
+      if (cartaoNumero != null && cartaoNumero.isNotEmpty) {
+        config.cartaoNumero = cartaoNumero;
+        debugPrint('[PEC] Cartao encontrado: $cartaoNumero, tentando abrir transacao...');
+
+        result = await _abrirTransacao(usarCpf: false);
+        if (result.success && result.data != null) {
+          _transIdAtual = result.data!.transId;
+          _transIdExpiracao = DateTime.now().add(const Duration(minutes: 5));
+          return _transIdAtual;
+        }
+      }
+
+      debugPrint('[PEC] Nao foi possivel abrir transacao com CPF');
+      return null;
     }
 
-    // Abre nova transacao
-    final result = await _abrirTransacao();
+    // Se nao e CPF, abre transacao normalmente com numero do cartao
+    final result = await _abrirTransacao(usarCpf: false);
     if (result.success && result.data != null) {
       _transIdAtual = result.data!.transId;
       _transIdExpiracao = DateTime.now().add(const Duration(minutes: 5));
@@ -330,16 +360,20 @@ class PecService {
         grupoId: grupoId,
       );
 
-      // Montar XML de validacao
+      // Montar XML de validacao (usa mesma logica da abertura de transacao)
+      final cartaoTag = config.isCpf ? '' : config.cartaoPec;
+      final cpfTag = config.isCpf ? config.cartaoPecOuCpf.replaceAll(RegExp(r'[^0-9]'), '') : '';
+
       final xmlBody = '<VALIDAR_PRODUTOS_PARAM>'
           '$_credenciaisXml'
-          '<CARTAO>${config.cartaoPec}</CARTAO>'
-          '<CPF></CPF>'
+          '<CARTAO>$cartaoTag</CARTAO>'
+          '<CPF>$cpfTag</CPF>'
           '<TRANSID>$transId</TRANSID>'
           '<PRODUTOS>${produto.toXml()}</PRODUTOS>'
           '</VALIDAR_PRODUTOS_PARAM>';
 
       debugPrint('[PEC] Validando produto: $codBarras');
+      debugPrint('[PEC] CARTAO: $cartaoTag, CPF: $cpfTag, TRANSID: $transId');
 
       final response = await _executeRequest(xmlBody, 'MValidarProdutos');
       final status = int.tryParse(_extractTag(response, 'STATUS')) ?? -1;

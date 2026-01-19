@@ -15,6 +15,7 @@ class _GruposExibicaoScreenState extends State<GruposExibicaoScreen> {
   List<GrupoExibicao> _grupos = [];
   bool _carregando = true;
   bool _carrosselAtivo = false;
+  bool _combosAtivo = true;
   int _tempoCarrossel = 10;
 
   @override
@@ -28,13 +29,15 @@ class _GruposExibicaoScreenState extends State<GruposExibicaoScreen> {
 
     final grupos = await ConfigService.getGruposExibicao();
     final carrosselAtivo = await ConfigService.isCarrosselAtivo();
-    final tempoCarrossel = await ConfigService.getTempoCarrossel();
+    final combosAtivo = await ConfigService.isCombosCarrosselAtivo();
+    final velocidadeCarrossel = await ConfigService.getVelocidadeCarrossel();
 
     if (mounted) {
       setState(() {
         _grupos = grupos;
         _carrosselAtivo = carrosselAtivo;
-        _tempoCarrossel = tempoCarrossel;
+        _combosAtivo = combosAtivo;
+        _tempoCarrossel = velocidadeCarrossel;
         _carregando = false;
       });
     }
@@ -45,30 +48,37 @@ class _GruposExibicaoScreenState extends State<GruposExibicaoScreen> {
     setState(() => _carrosselAtivo = valor);
   }
 
-  Future<void> _alterarTempoCarrossel() async {
-    final tempos = [5, 8, 10, 15, 20, 30];
+  Future<void> _toggleCombos(bool valor) async {
+    await ConfigService.saveCombosCarrosselAtivo(valor);
+    setState(() => _combosAtivo = valor);
+  }
+
+  Future<void> _alterarVelocidadeCarrossel() async {
+    final niveis = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
     final resultado = await showDialog<int>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Tempo de Exibicao'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: tempos.map((t) => ListTile(
-            title: Text('$t segundos'),
-            leading: Radio<int>(
-              value: t,
-              groupValue: _tempoCarrossel,
-              onChanged: (v) => Navigator.pop(context, v),
-            ),
-            onTap: () => Navigator.pop(context, t),
-          )).toList(),
+        title: const Text('Velocidade do Carrossel'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: niveis.map((n) => ListTile(
+              title: Text(ConfigService.getNomeVelocidade(n)),
+              leading: Radio<int>(
+                value: n,
+                groupValue: _tempoCarrossel,
+                onChanged: (v) => Navigator.pop(context, v),
+              ),
+              onTap: () => Navigator.pop(context, n),
+            )).toList(),
+          ),
         ),
       ),
     );
 
     if (resultado != null) {
-      await ConfigService.saveTempoCarrossel(resultado);
+      await ConfigService.saveVelocidadeCarrossel(resultado);
       setState(() => _tempoCarrossel = resultado);
     }
   }
@@ -213,15 +223,33 @@ class _GruposExibicaoScreenState extends State<GruposExibicaoScreen> {
                           activeColor: Colors.green,
                         ),
 
+                        // Switch para exibir combos
+                        SwitchListTile(
+                          title: const Text('Exibir Combos/Kits'),
+                          subtitle: Text(
+                            _combosAtivo
+                                ? 'Combos ativos serao exibidos'
+                                : 'Combos desativados',
+                            style: TextStyle(
+                              color: _combosAtivo
+                                  ? Colors.deepPurple.shade600
+                                  : Colors.grey.shade600,
+                            ),
+                          ),
+                          value: _combosAtivo,
+                          onChanged: _toggleCombos,
+                          activeColor: Colors.deepPurple,
+                        ),
+
                         const Divider(),
 
-                        // Tempo de exibicao
+                        // Velocidade do carrossel
                         ListTile(
-                          leading: Icon(Icons.timer, color: Colors.blue.shade600),
-                          title: const Text('Tempo de Exibicao'),
-                          subtitle: Text('$_tempoCarrossel segundos por produto'),
+                          leading: Icon(Icons.speed, color: Colors.blue.shade600),
+                          title: const Text('Velocidade de Passagem'),
+                          subtitle: Text(ConfigService.getNomeVelocidade(_tempoCarrossel)),
                           trailing: const Icon(Icons.arrow_forward_ios, size: 16),
-                          onTap: _alterarTempoCarrossel,
+                          onTap: _alterarVelocidadeCarrossel,
                         ),
                       ],
                     ),
@@ -735,10 +763,9 @@ class _EditarGrupoExibicaoScreenState extends State<EditarGrupoExibicaoScreen> {
                     return DropdownMenuItem(
                       value: filtro,
                       child: Text(switch (filtro) {
-                        FiltroEstoqueDesconto.todos => 'Todos os produtos',
-                        FiltroEstoqueDesconto.somenteEstoque => 'Somente com estoque',
-                        FiltroEstoqueDesconto.somenteDesconto => 'Somente com desconto',
-                        FiltroEstoqueDesconto.estoqueEDesconto => 'Com estoque E desconto',
+                        FiltroEstoqueDesconto.todos => 'Todos os produtos e combos',
+                        FiltroEstoqueDesconto.comDesconto => 'Somente com desconto',
+                        FiltroEstoqueDesconto.descontoEEstoque => 'Com desconto e estoque',
                       }),
                     );
                   }).toList(),
